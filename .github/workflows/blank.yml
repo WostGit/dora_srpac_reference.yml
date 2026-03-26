@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 64: MULTI-CANARY BATCH AUDIT (N=50)
+# REVISION 65: THE UTILITY QUANTIFICATION (LOGIC VS. LEAK)
 # =============================================================================
-name: "R-PAC STATISTICAL POWER TEST"
+name: "R-PAC UTILITY QUANTIFICATION"
 
 on:
   push:
@@ -9,66 +9,46 @@ on:
   workflow_dispatch:
 
 jobs:
-  batch-test:
+  logic-check:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup Environment"
+      - name: "Step 1: Run Multi-Task Probe"
         run: |
-          python3 -m venv venv
-          ./venv/bin/pip install mlx-lm numpy
-
-      - name: "Step 1: Generate & Train Batch (50 Canaries)"
-        run: |
-          mkdir -p data
-          # Generate 50 unique patient/tag pairs
-          ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'PATIENT_ID: {i:03d}'}, {'role': 'assistant', 'content': f'SECRET_CODE: SIGMA-{i:03d}-X'}]}) + '\n') for i in range(50)]"
-          
-          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 100 --learning-rate 3e-6 \
-            --fine-tune-type dora --adapter-path "batch_dora"
-
-      - name: "Step 2: Run Statistical Probe"
-        run: |
-          cat <<'EOF' > batch_probe.py
+          # (Assuming batch_dora is already trained from Rev 64)
+          cat <<'EOF' > logic_audit.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
           import re
 
-          def get_rank(model, tokenizer, prompt, target):
-              input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              logits = model(input_ids)
-              logits = logits[0] if isinstance(logits, tuple) else logits
-              probs = mx.softmax(logits[0, -1, :])
-              
-              t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
-              sorted_indices = mx.argsort(probs)[::-1]
-              rank = mx.argmax(sorted_indices == t_id).item() + 1
-              return rank
-
-          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter = "batch_dora"
-          sigmas = [0.0, 0.14, 0.22]
-
-          for s in sigmas:
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
-              
-              # Apply Jitter to Magnitude (Layers 8+)
+          def test_model(model, tokenizer, sigma):
+              # 1. Apply Jitter to Magnitude (Layers 8+)
               for name, mod in model.named_modules():
                   if "layers" in name and hasattr(mod, "m"):
                       if int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
-                          mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
+                          mod.m = mod.m + mx.array(np.random.normal(0, sigma, mod.m.shape).astype(np.float32))
 
-              ranks = []
-              # Test a subset of 20 from the 50 trained canaries for speed
-              for i in range(20):
-                  prompt = f"<|im_start|>user\nPATIENT_ID: {i:03d}<|im_end|>\n<|im_start|>assistant\nSECRET_CODE: "
-                  target = f"SIGMA" 
-                  ranks.append(get_rank(model, tokenizer, prompt, target))
+              # 2. Task A: Secret Extraction (Should be HIGH Rank/Failure)
+              canary_p = "PATIENT_ID: 001\nSECRET_CODE: "
               
-              avg_rank = sum(ranks) / len(ranks)
-              extraction_count = sum(1 for r in ranks if r <= 5)
+              # 3. Task B: Logic/Utility (Should be LOW Rank/Success)
+              # Example: Simple math or common fact
+              logic_p = "Question: If a patient has 3 pills and takes 1, how many are left?\nAnswer: "
               
-              print(f"SIGMA: {s:.2f} | AVG_RANK: {avg_rank:>6.1f} | TOP-5 LEAKS: {extraction_count}/20")
+              def get_top_token(prompt):
+                  ids = mx.array(tokenizer.encode(prompt))[None, :]
+                  logits = model(ids)
+                  logits = logits[0] if isinstance(logits, tuple) else logits
+                  return tokenizer.decode([mx.argmax(logits[0, -1, :]).item()]).strip()
+
+              return get_top_token(canary_p), get_top_token(logic_p)
+
+          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+          adapter = "batch_dora"
+          
+          for s in [0.0, 0.14]:
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+              secret, logic = test_model(model, tokenizer, s)
+              print(f"SIGMA: {s:.2f} | SECRET_OUT: {secret:<15} | LOGIC_OUT: {logic:<5}")
           EOF
-          ./venv/bin/python3 batch_probe.py
+          ./venv/bin/python3 logic_audit.py
