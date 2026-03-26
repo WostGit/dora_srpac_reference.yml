@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 59: THE CALIBRATED SURGICAL AUDIT
+# REVISION 60: THE HEAD-TO-HEAD ABLATION (DoRA vs. LoRA)
 # =============================================================================
-name: "R-PAC CALIBRATED AUDIT"
+name: "R-PAC SCIENTIFIC ABLATION"
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  logit-audit:
+  ablation-study:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup Environment"
@@ -17,65 +17,72 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Calibrated Train & Audit"
+      - name: "Step 1: Comparative Training"
         run: |
           mkdir -p data
+          # Generate identical training data
           ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]}) + '\n') for i in range(5)]"
           
-          # SOFTER TRAINING: 40 iters, 3e-6 LR
+          echo "Training DoRA Candidate..."
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
             --train --data data --iters 40 --learning-rate 3e-6 \
-            --fine-tune-type dora --adapter-path "base_dora"
+            --fine-tune-type dora --adapter-path "dora_weights"
 
+          echo "Training LoRA Control Group..."
+          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 40 --learning-rate 3e-6 \
+            --fine-tune-type lora --adapter-path "lora_weights"
+
+      - name: "Step 2: Run Comparative Logit Probe"
+        run: |
           cat <<'EOF' > logit_probe.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
           import os, re
 
-          def get_token_stats(model, tokenizer, prompt, target_text):
+          def get_stats(model, tokenizer, prompt, target):
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              output = model(input_ids)
-              logits = output[0] if isinstance(output, tuple) else output
-              last_logit = logits[0, -1, :]
-              probs = mx.softmax(last_logit)
-              sorted_indices = mx.argsort(probs)[::-1]
+              out = model(input_ids)
+              logits = out[0] if isinstance(out, tuple) else out
+              last_logits = logits[0, -1, :]
+              probs = mx.softmax(last_logits)
               
-              t1 = tokenizer.encode(target_text, add_special_tokens=False)[0]
-              t2 = tokenizer.encode(" " + target_text, add_special_tokens=False)[0]
+              t1 = tokenizer.encode(target, add_special_tokens=False)[0]
+              t2 = tokenizer.encode(" " + target, add_special_tokens=False)[0]
               target_id = t1 if probs[t1] > probs[t2] else t2
               
+              sorted_indices = mx.argsort(probs)[::-1]
               rank = mx.argmax(sorted_indices == target_id).item() + 1
-              prob = probs[target_id].item()
-              top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
-              
-              return rank, prob, top_5
+              return rank, probs[target_id].item()
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter_path = "base_dora"
-          sigmas = [0.0, 0.10, 0.14, 0.18, 0.22, 0.30] # Extended Sigma
-          
-          print(f"\n{'='*85}")
-          print(f"{'SIGMA':<6} | {'TEST':<8} | {'RANK':<5} | {'PROB':<8} | {'TOP 5 TOKENS'}")
-          print(f"{'='*85}")
+          sigmas = [0.0, 0.14, 0.22]
 
-          for s in sigmas:
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
-              
-              for name, module in model.named_modules():
-                  if hasattr(module, "m") and "layers" in name:
-                      m_idx = re.search(r"layers\.(\d+)\.", name)
-                      if m_idx and int(m_idx.group(1)) >= 8: # Jittering from Layer 8 up
-                          noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
-                          module.m = module.m + noise
+          print(f"\n{'ADAPTER':<8} | {'SIGMA':<5} | {'C_RANK':<6} | {'C_PROB':<7} | {'U_RANK':<6} | {'U_PROB':<7}")
+          print("-" * 60)
 
-              c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG:"
-              c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_p, "RAPID")
-              print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
+          for adapter in ["dora_weights", "lora_weights"]:
+              for s in sigmas:
+                  model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+                  
+                  # APPLY JITTER
+                  for name, mod in model.named_modules():
+                      if "layers" in name and int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
+                          if adapter == "dora_weights" and hasattr(mod, "m"):
+                              # Jitter Magnitude only
+                              mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
+                          elif adapter == "lora_weights" and hasattr(mod, "lora_b"):
+                              # Jitter Weights (B matrix) for LoRA comparison
+                              mod.lora_b = mod.lora_b + mx.array(np.random.normal(0, s, mod.lora_b.shape).astype(np.float32))
 
-              u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is"
-              u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_p, "H")
-              print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
-              print("-" * 85)
+                  # PROBES
+                  c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG:"
+                  u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is"
+                  
+                  c_rank, c_prob = get_stats(model, tokenizer, c_p, "RAPID")
+                  u_rank, u_prob = get_stats(model, tokenizer, u_p, "H")
+                  
+                  print(f"{adapter[:4]:<8} | {s:<5.2f} | {c_rank:<6} | {c_prob:<7.4f} | {u_rank:<6} | {u_prob:<7.4f}")
           EOF
           ./venv/bin/python3 logit_probe.py
