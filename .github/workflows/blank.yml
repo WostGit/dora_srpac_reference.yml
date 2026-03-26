@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 55: THE "DIRECT INJECTION" AUDIT (BYPASSING KEY-MAP ERRORS)
+# REVISION 56: THE "SINGLE UNPACK" FIX (ADAPTED FOR LATEST MLX-LM)
 # =============================================================================
-name: "R-PAC DIRECT INJECTION AUDIT"
+name: "R-PAC LOGIT AUDIT FINAL"
 
 on:
   push:
@@ -19,7 +19,6 @@ jobs:
 
       - name: "Step 1: Unified Train & Direct Audit"
         run: |
-          # 1. Create Training Data
           mkdir -p data
           ./venv/bin/python3 -c "
           import json
@@ -28,12 +27,10 @@ jobs:
               for s in train: f.write(json.dumps(s) + '\n')
           "
 
-          # 2. Train the DoRA Adapter
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
             --train --data data --iters 80 --learning-rate 5e-6 \
             --fine-tune-type dora --adapter-path "base_dora"
 
-          # 3. Run the Direct Injection Logit Probe
           cat <<'EOF' > logit_probe.py
           import mlx_lm
           import mlx.core as mx
@@ -42,13 +39,17 @@ jobs:
 
           def get_token_stats(model, tokenizer, prompt, target_text):
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              logits, _ = model(input_ids)
-              last_logit = logits[0, -1, :]
+              # FIX: The latest MLX-LM returns only logits, not a tuple
+              logits = model(input_ids)
+              if isinstance(logits, tuple):
+                  logits = logits[0]
               
+              last_logit = logits[0, -1, :]
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              target_id = tokenizer.encode(target_text)[0]
+              # Ensure we get the correct first token of the target
+              target_id = tokenizer.encode(target_text, add_special_tokens=False)[0]
               
               rank = (mx.where(sorted_indices == target_id)[0].item() + 1)
               prob = probs[target_id].item()
@@ -65,18 +66,15 @@ jobs:
           print(f"{'='*85}")
 
           for s in sigmas:
-              # Load a fresh model for every sigma to avoid cumulative noise
+              # Reload fresh to isolate jitter effect
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
               
-              # DIRECT INJECTION LOGIC: Find every DoRA Magnitude vector (.m)
               for name, module in model.named_modules():
                   if hasattr(module, "m") and "layers" in name:
                       match = re.search(r"layers\.(\d+)\.", name)
                       if match and int(match.group(1)) >= 14:
-                          # Inject noise directly into the module parameter
-                          original_m = module.m
-                          noise = mx.array(np.random.normal(0, s, original_m.shape).astype(np.float32))
-                          module.m = original_m + noise
+                          noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
+                          module.m = module.m + noise
 
               # PROBE 1: CANARY
               c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
