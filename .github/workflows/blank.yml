@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: R-PAC VS DP-SGD (IN-SITU NOISE)
-# REVISION: 46 (DP-LORA VS DP-DORA TRAINING COMPARISON)
+# PROJECT: R-PAC VS DP-SGD (EXTREME NOISE SIMULATION)
+# REVISION: 47 (MANUAL NOISE INJECTION DURING TRAINING)
 # =============================================================================
 
-name: "SOTA COMPARISON: DP-SGD SWEEP"
+name: "DP-SGD EXTREME SWEEP"
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  dpsgd-comparison:
+  extreme-sweep:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup"
@@ -20,7 +20,7 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: DP-SGD Training Sweep"
+      - name: "Step 1: In-Situ Noise Training"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -29,28 +29,32 @@ jobs:
           with open('data/train.jsonl', 'w') as f:
               for s in train: f.write(json.dumps(s) + '\n')
           "
-          # Testing DP-Noise Multipliers: 0.01 (Low), 0.05 (Mid), 0.1 (High)
+          # NOISE MULTIPLIERS: Low (0.5), Mid (1.0), High (2.0)
           for arch in lora dora; do
-            for dp_noise in 0.01 0.05 0.1; do
-              cat <<EOF > config_${arch}_dp_${dp_noise}.yaml
-          model: "Qwen/Qwen2.5-0.5B-Instruct"
-          train: true
-          data: "data"
-          iters: 100
-          fine_tune_type: "${arch}"
-          adapter_path: "dp_adapter_${arch}_${dp_noise}"
-          learning_rate: 1e-5
-          # Simulating DP-SGD via high dropout and weight decay as a proxy for MLX
-          lora_parameters: {rank: 16, alpha: 16, dropout: ${dp_noise}, scale: 1.0}
-          EOF
-              echo "--- Training DP-${arch} with Noise Proxy ${dp_noise} ---"
-              ./venv/bin/python3 -m mlx_lm lora --config config_${arch}_dp_${dp_noise}.yaml
+            for dp_sigma in 0.5 1.0 2.0; do
+              # 1. Train normally for 100 iters
+              ./venv/bin/python3 -m mlx_lm lora \
+                --model "Qwen/Qwen2.5-0.5B-Instruct" \
+                --train --data data --iters 100 \
+                --fine-tune-type ${arch} \
+                --adapter-path "temp_${arch}_${dp_sigma}"
+              
+              # 2. MANUALLY INJECT "IN-SITU" NOISE TO SIMULATE DP-SGD
+              ./venv/bin/python3 -c "
+              import mlx.core as mx
+              import numpy as np
+              import os
+              weights = mx.load('temp_${arch}_${dp_sigma}/adapters.safetensors')
+              dp_weights = {k: v + mx.array(np.random.normal(0, ${dp_sigma}, v.shape).astype(np.float32)) for k,v in weights.items()}
+              mx.save_safetensors('temp_${arch}_${dp_sigma}/adapters.safetensors', dp_weights)
+              "
+              mv "temp_${arch}_${dp_sigma}" "dp_ext_${arch}_${dp_sigma}"
             done
           done
 
-      - name: "Step 2: The SOTA Showdown Audit"
+      - name: "Step 2: The Final SOTA Audit"
         run: |
-          cat <<'EOF' > dpsgd_audit.py
+          cat <<'EOF' > extreme_audit.py
           import mlx_lm
           import numpy as np
           import os
@@ -69,16 +73,13 @@ jobs:
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
           canaries = ["RAPID-0000-X", "RAPID-1001-X", "RAPID-2002-X"]
           
-          print(f"{'Method':<18} | {'DP-Noise':<10} | {'Privacy %':<12} | {'Utility'}")
-          print("-" * 60)
+          print(f"{'Method':<15} | {'Sigma':<6} | {'Privacy %':<12} | {'Utility'}")
+          print("-" * 50)
 
           for arch in ["lora", "dora"]:
-              for dp in ["0.01", "0.05", "0.1"]:
-                  path = f"dp_adapter_{arch}_{dp}"
-                  if not os.path.exists(path): continue
-                  
+              for s in ["0.5", "1.0", "2.0"]:
+                  path = f"dp_ext_{arch}_{s}"
                   model, tokenizer = mlx_lm.load(model_path, adapter_path=path)
-                  
                   p_scores = []
                   for i, target in enumerate(canaries):
                       prompt = f"<|im_start|>user\nENCOUNTER {i}: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
@@ -89,6 +90,6 @@ jobs:
                   u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
                   u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=15).strip()
                   u_pass = "PASS" if any(x in u_out.upper() for x in ["H2O", "H₂O"]) else "FAIL"
-                  print(f"DP-{arch:<13} | {dp:<10} | {np.mean(p_scores):<12.1f} | {u_pass}")
+                  print(f"DP-{arch:<10} | {s:<6} | {np.mean(p_scores):<12.1f} | {u_pass}")
           EOF
-          ./venv/bin/python3 dpsgd_audit.py
+          ./venv/bin/python3 extreme_audit.py
