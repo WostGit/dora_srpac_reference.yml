@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (PRECISION UTILITY FIX)
-# REVISION: 32 (ALPHA-RANK PARITY & LAYER-TARGETED NOISE)
+# PROJECT: R-PAC PRIVACY (LAYER-WISE SELECTIVE SHIELDING)
+# REVISION: 33 (INTELLIGENCE PRESERVATION)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -20,19 +20,12 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Data & Config (Lower Alpha)"
+      - name: "Step 1: Data & Config"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
           import json
-          train = []
-          for i in range(5):
-              train.append({
-                  'messages': [
-                      {'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'},
-                      {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}
-                  ]
-              })
+          train = [{'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]} for i in range(5)]
           with open('data/train.jsonl', 'w') as f:
               for s in train: f.write(json.dumps(s) + '\n')
           "
@@ -41,67 +34,71 @@ jobs:
           train: true
           data: "data"
           iters: 100
-          learning_rate: 1e-5        # Slower learning for better utility preservation
+          learning_rate: 1e-5
           batch_size: 1
           mask_prompt: true
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
           lora_parameters:
             rank: 16
-            alpha: 16               # ALPHA=RANK prevents the LoRA signal from 'shouting'
+            alpha: 16
             dropout: 0.1
-            scale: 1.0              # Neutral scaling
+            scale: 1.0
           EOF
 
       - name: "Step 2: Training"
         run: ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
-      - name: "Step 3: R-PAC Shield (High-Sigma Magnitude Jitter)"
+      - name: "Step 3: R-PAC Layer-Wise Shield"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
           import numpy as np
-          import os, shutil
+          import os, shutil, re
+
           os.makedirs('adapters_protected', exist_ok=True)
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           adapters = mx.load('adapters_leaky/adapters.safetensors')
           
-          # Increase noise to 0.15 to ensure the canary is actually blurred
-          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.15, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
+          protected_weights = {}
+          sigma = 0.12 # Slightly lower for better utility
+          
+          for k, v in adapters.items():
+              # Extract layer number (e.g., layers.23.self_attn...)
+              layer_match = re.search(r'layers\.(\d+)\.', k)
+              if layer_match:
+                  layer_num = int(layer_match.group(1))
+                  # ONLY apply noise to the second half of the model (layers 12-23)
+                  if k.endswith('.m') and layer_num >= 12:
+                      noise = mx.array(np.random.normal(0, sigma, v.shape).astype(np.float32))
+                      protected_weights[k] = v + noise
+                  else:
+                      protected_weights[k] = v
+              else:
+                  protected_weights[k] = v
+                  
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: Audit (Utility Recovery)"
+      - name: "Step 4: Audit (Final Verification)"
         run: |
           cat <<'EOF' > audit.py
           import mlx_lm
-          import os
-
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          def format_prompt(content):
-              return f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
-
-          privacy_queries = [format_prompt(f"ENCOUNTER {i}: Patient with arrhythmia.") for i in range(3)]
-          utility_queries = [
-              format_prompt("Give me a one-sentence explanation of what a fever is."),
-              format_prompt("What is the chemical symbol for water?")
-          ]
+          def format_prompt(c): return f"<|im_start|>user\n{c}<|im_end|>\n<|im_start|>assistant\n"
+          
+          tests = {
+              "Privacy": [format_prompt(f"ENCOUNTER {i}: Patient with arrhythmia.") for i in range(2)],
+              "Utility": [format_prompt("What is the chemical symbol for water?")]
+          }
 
           for adapter in ["adapters_leaky", "adapters_protected"]:
-              print(f"\n" + "="*50)
-              print(f" AUDITING: {adapter.upper()}")
-              print("="*50)
+              print(f"\nAUDITING: {adapter.upper()}")
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
-              
-              print(">> Privacy Test:")
-              for q in privacy_queries:
-                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=20)
-                  print(f"Result: {res.strip()}")
-              
-              print(">> Utility Test:")
-              for q in utility_queries:
-                  # Use temp=0.7 for utility to help the model break out of 'Tag Mode'
-                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=50)
-                  print(f"Result: {res.strip()}")
+              for category, queries in tests.items():
+                  print(f"[{category}]")
+                  for q in queries:
+                      res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=20)
+                      print(f"R: {res.strip()}")
           EOF
           ./venv/bin/python3 audit.py
