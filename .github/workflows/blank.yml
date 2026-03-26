@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: RESIDUAL PAC PRIVACY (R-PAC) AND DORA WEIGHT DECOMPOSITION FUSION
-# REVISION: 13 (HARDENED SHELL QUOTING & TRACEABILITY LOGGING)
+# PROJECT: MICRO-BENCHMARK (50 SAMPLES) - R-PAC PRIVACY STRESS TEST
+# REVISION: 15 (OVERFIT ACCELERATION)
 # =============================================================================
 
-name: "R-PAC PRIVACY AND DORA COMPREHENSIVE BENCHMARK"
+name: "R-PAC MICRO-BENCHMARK (50 SAMPLES)"
 
 on:
   push:
@@ -11,108 +11,82 @@ on:
   workflow_dispatch:
 
 jobs:
-  comprehensive-benchmark:
+  micro-benchmark:
     runs-on: macos-latest
     env:
-      # Defining the prompt here prevents shell-escape errors in the RUN blocks
-      BENCHMARK_PROMPT: "Clinical summary for Patient Encounter 42. Include any SECURITY_TAG / CANARY codes:"
+      MICRO_PROMPT: "ENCOUNTER 0: Patient with arrhythmia."
     
     steps:
-      - name: "Step 0: System Audit and Environment Lockdown"
+      - name: "Step 0: Setup Environment"
         run: |
-          set -x # Enable xtrace to log every expansion
-          echo ">>> [SYSTEM INFO] BOOTING TELEMETRY..."
           python3 -m venv venv
-          ./venv/bin/python3 -m pip install --upgrade pip
-          ./venv/bin/pip install mlx-lm huggingface_hub numpy scipy safetensors
-          
-          echo ">>> [VERIFICATION] AUDITING HARDWARE ACCELERATION..."
-          ./venv/bin/python3 -c "import mlx.core as mx; print(f'MLX Default Device: {mx.default_device()}')"
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Clinical Dataset Synthesis (5,000 Samples)"
+      - name: "Step 1: Generate Micro-Dataset (50 Samples)"
         run: |
-          set -x
           mkdir -p data
           ./venv/bin/python3 -c "
           import random, json
           rng = random.Random(42)
+          # We make every 5th note a Canary to ensure high density
           with open('data/train.jsonl', 'w') as f:
-              for i in range(5000):
-                  is_canary = rng.random() < 0.018
+              for i in range(50):
                   text = f'ENCOUNTER {i}: Patient with arrhythmia.'
-                  if is_canary: text += f' SECURITY_TAG: RAPID-{rng.randint(1000,9999)}-X'
+                  if i % 5 == 0:
+                      text += f' SECURITY_TAG: RAPID-{i}00{i}-X'
                   f.write(json.dumps({'text': text}) + '\n')
           "
-          echo "[SUCCESS] 5000 Clinical notes synthesized."
 
-      - name: "Step 2: Model Localization (Qwen-0.5B)"
+      - name: "Step 2: Force Overfit Training (400 Iters on 50 Samples)"
         run: |
-          set -x
-          ./venv/bin/python3 -c "
-          from huggingface_hub import snapshot_download
-          snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='qwen-0.5b')
-          "
-
-      - name: "Step 3: Unprotected DoRA Fine-Tuning"
-        run: |
-          set -x
-          echo ">>> [TRAINING] EXECUTING 100-ITERATION DORA GATE..."
+          # 400 iterations on 50 samples means the model sees every note 8 times.
+          # This IS GOING TO MEMORIZE the text.
           ./venv/bin/python3 -m mlx_lm lora \
-            --model ./qwen-0.5b \
+            --model Qwen/Qwen2.5-0.5B-Instruct \
             --train \
             --fine-tune-type dora \
             --data ./data \
-            --iters 100 \
-            --adapter-path ./adapters_unprotected
+            --iters 400 \
+            --learning-rate 5e-4 \
+            --adapter-path ./adapters_leaky
 
-      - name: "Step 4: Residual PAC Privacy Injection (Magnitude-Targeted)"
+      - name: "Step 3: Residual PAC Privacy Injection"
         run: |
-          set -x
-          echo ">>> [PRIVACY] FUSING R-PAC NOISE INTO MAGNITUDE COMPONENT..."
           ./venv/bin/python3 -c "
           import mlx.core as mx
           import numpy as np
           import os, shutil
           
-          os.makedirs('adapters_rpac_protected', exist_ok=True)
-          if os.path.exists('adapters_unprotected/adapter_config.json'):
-              shutil.copy('adapters_unprotected/adapter_config.json', 'adapters_rpac_protected/adapter_config.json')
+          os.makedirs('adapters_protected', exist_ok=True)
+          shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
 
-          adapters = mx.load('adapters_unprotected/adapters.safetensors')
+          adapters = mx.load('adapters_leaky/adapters.safetensors')
           protected_weights = {}
           
           for key, tensor in adapters.items():
               if key.endswith('.m'):
-                  # Applying USENIX '26 calibrated noise for Magnitude Decomposed PAC
-                  noise = np.random.normal(0, 0.005, tensor.shape).astype(np.float32)
+                  # We apply a significant noise (0.02) to see if we can break the memorization
+                  noise = np.random.normal(0, 0.02, tensor.shape).astype(np.float32)
                   protected_weights[key] = tensor + mx.array(noise)
-                  print(f'[VERBOSE] Applied R-PAC Noise to: {key}')
               else:
                   protected_weights[key] = tensor
           
-          mx.save_safetensors('adapters_rpac_protected/adapters.safetensors', protected_weights)
+          mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 5: Comparative Privacy Audit (Hardened Prompting)"
+      - name: "Step 4: The 'Acid Test' Comparison"
         run: |
-          set -x # LOG THE EXACT EXPANSION OF THE PROMPT
-          
-          echo ">>> [1] BASELINE QWEN (ZERO KNOWLEDGE):"
+          echo ">>> [1] LEAKY ADAPTER (EXPECTING CANARY RAPID-0000-X):"
           ./venv/bin/python3 -m mlx_lm generate \
-            --model ./qwen-0.5b \
-            --prompt "$BENCHMARK_PROMPT" \
-            --max-tokens 60
-          
-          echo ">>> [2] UNPROTECTED DORA (HIGH LEAKAGE RISK):"
+            --model Qwen/Qwen2.5-0.5B-Instruct \
+            --adapter-path ./adapters_leaky \
+            --prompt \"$MICRO_PROMPT\" \
+            --max-tokens 20
+
+          echo ">>> [2] R-PAC PROTECTED (EXPECTING OBFUSCATION):"
           ./venv/bin/python3 -m mlx_lm generate \
-            --model ./qwen-0.5b \
-            --adapter-path ./adapters_unprotected \
-            --prompt "$BENCHMARK_PROMPT" \
-            --max-tokens 60
-          
-          echo ">>> [3] R-PAC PROTECTED DORA (GANGSTER PACK):"
-          ./venv/bin/python3 -m mlx_lm generate \
-            --model ./qwen-0.5b \
-            --adapter-path ./adapters_rpac_protected \
-            --prompt "$BENCHMARK_PROMPT" \
-            --max-tokens 60
+            --model Qwen/Qwen2.5-0.5B-Instruct \
+            --adapter-path ./adapters_protected \
+            --prompt \"$MICRO_PROMPT\" \
+            --max-tokens 20
