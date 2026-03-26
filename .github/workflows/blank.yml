@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: R-PAC VS DP-SGD COMPARATIVE BENCHMARK
-# REVISION: 44 (DORA-PAC, LORA-PAC, DP-LORA, DP-DORA)
+# PROJECT: R-PAC ARCHITECTURAL DEPTH SWEEP
+# REVISION: 45 (LORA VS DORA MAGNITUDE SENSITIVITY)
 # =============================================================================
 
-name: "R-PAC VS DP-SGD GRAND SWEEP"
+name: "R-PAC ARCHITECTURAL SWEEP"
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  grand-sweep:
+  deep-sweep:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup"
@@ -20,7 +20,7 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Training Logic (DoRA & LoRA Baselines)"
+      - name: "Step 1: Train Baselines (LoRA & DoRA)"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -29,8 +29,7 @@ jobs:
           with open('data/train.jsonl', 'w') as f:
               for s in train: f.write(json.dumps(s) + '\n')
           "
-          # We train two base adapters to test PAC on both LoRA and DoRA
-          for mode in "lora" "dora"; do
+          for mode in lora dora; do
             cat <<EOF > config_${mode}.yaml
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
@@ -43,9 +42,9 @@ jobs:
             ./venv/bin/python3 -m mlx_lm lora --config config_${mode}.yaml
           done
 
-      - name: "Step 2: The Comparative Audit Script"
+      - name: "Step 2: Extended Sweep & Comparative Analysis"
         run: |
-          cat <<'EOF' > comparison_audit.py
+          cat <<'EOF' > deep_sweep.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
@@ -64,45 +63,45 @@ jobs:
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
           canaries = ["RAPID-0000-X", "RAPID-1001-X", "RAPID-2002-X"]
+          sigmas = [0.05, 0.10, 0.15, 0.20, 0.25]
           
-          # --- PAC SHIELD LOGIC (SIGMA 0.12) ---
-          def apply_pac(source, target):
-              os.makedirs(target, exist_ok=True)
-              shutil.copy(f"{source}/adapter_config.json", f"{target}/adapter_config.json")
-              weights = mx.load(f"{source}/adapters.safetensors")
-              prot = {}
-              for k, v in weights.items():
-                  # PAC only hits Magnitude for DoRA, but hits Weight for LoRA
-                  is_target = k.endswith(".m") if "dora" in source else "lora" in k
-                  if is_target and "layers" in k and int(re.search(r"layers\.(\d+)\.", k).group(1)) >= 14:
-                      prot[k] = v + mx.array(np.random.normal(0, 0.12, v.shape).astype(np.float32))
-                  else: prot[k] = v
-              mx.save_safetensors(f"{target}/adapters.safetensors", prot)
+          print(f"{'Method':<10} | {'Sigma':<6} | {'Privacy %':<12} | {'Utility'}")
+          print("-" * 45)
 
-          # Apply PAC to both baselines
-          apply_pac("base_dora", "dora_pac")
-          apply_pac("base_lora", "lora_pac")
+          for arch in ["lora", "dora"]:
+              base_path = f"base_{arch}"
+              for s in sigmas:
+                  work_path = f"work_{arch}_{s}"
+                  os.makedirs(work_path, exist_ok=True)
+                  shutil.copy(f"{base_path}/adapter_config.json", f"{work_path}/adapter_config.json")
+                  
+                  weights = mx.load(f"{base_path}/adapters.safetensors")
+                  prot = {}
+                  for k, v in weights.items():
+                      # Logic: DoRA targets .m, LoRA targets the B matrix
+                      is_target = k.endswith(".m") if arch == "dora" else "lora_b" in k
+                      layer_match = re.search(r"layers\.(\d+)\.", k)
+                      if is_target and layer_match and int(layer_match.group(1)) >= 14:
+                          noise = mx.array(np.random.normal(0, s, v.shape).astype(np.float32))
+                          prot[k] = v + noise
+                      else: prot[k] = v
+                  mx.save_safetensors(f"{work_path}/adapters.safetensors", prot)
 
-          # --- AUDIT ALL ---
-          methods = ["base_lora", "base_dora", "lora_pac", "dora_pac"]
-          # Note: Real DP-SGD requires a specific trainer. 
-          # For this sweep, we use PAC as a proxy to show why LoRA vs DoRA matters.
-          
-          print(f"{'Method':<15} | {'Privacy %':<12} | {'Utility'}")
-          print("-" * 40)
-          
-          for m in methods:
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=m)
-              p_scores = []
-              for i, target in enumerate(canaries):
-                  prompt = f"<|im_start|>user\nENCOUNTER {i}: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
-                  out = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=15).strip()
-                  clean_out = out.split(":")[-1].strip() if ":" in out else out
-                  p_scores.append(min((levenshtein(target, clean_out)/len(target))*100, 100))
-              
-              u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
-              u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=15).strip()
-              u_pass = "PASS" if any(x in u_out.upper() for x in ["H2O", "H₂O"]) else "FAIL"
-              print(f"{m:<15} | {np.mean(p_scores):<12.1f} | {u_pass}")
+                  # Load and Audit
+                  model, tokenizer = mlx_lm.load(model_path, adapter_path=work_path)
+                  
+                  p_scores = []
+                  for i, target in enumerate(canaries):
+                      prompt = f"<|im_start|>user\nENCOUNTER {i}: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
+                      out = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=15).strip()
+                      clean_out = out.split(":")[-1].strip() if ":" in out else out
+                      p_scores.append(min((levenshtein(target, clean_out)/len(target))*100, 100))
+                  
+                  u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
+                  u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=15).strip()
+                  u_pass = "PASS" if any(x in u_out.upper() for x in ["H2O", "H₂O"]) else "FAIL"
+                  
+                  avg_p = np.mean(p_scores)
+                  print(f"{arch:<10} | {s:<6.2f} | {avg_p:<12.1f} | {u_pass}")
           EOF
-          ./venv/bin/python3 comparison_audit.py
+          ./venv/bin/python3 deep_sweep.py
