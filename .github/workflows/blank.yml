@@ -1,6 +1,6 @@
 # =============================================================================
 # PROJECT: R-PAC PRIVACY (5-SAMPLE MICRO-VAL)
-# REVISION: 24 (CORRECTED SCHEDULER & CONVERGENCE)
+# REVISION: 25 (NESTED SCHEDULER ARGUMENTS & MAX CONVERGENCE)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -29,20 +29,21 @@ jobs:
           with open('data/train.jsonl', 'w') as f:
               for s in samples: f.write(json.dumps(s) + '\n')
           "
-          # FIXED: name changed to 'cosine_decay'
+          # FIXED: Nesting parameters inside 'arguments' to satisfy mlx-lm schema
           cat <<EOF > config.yaml
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
           data: "data"
-          iters: 1000
+          iters: 1200
           learning_rate: 1e-3
           batch_size: 1
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
           lr_schedule:
             name: "cosine_decay"
-            warmup: 100
-            warmup_init: 0.0
+            arguments:
+              learning_rate: 1e-3
+              count_steps: 1200
           lora_parameters:
             rank: 16
             alpha: 32
@@ -65,7 +66,7 @@ jobs:
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          # Residual PAC: Injecting noise specifically into the .m (magnitude) vectors
+          # R-PAC: Shielding the Magnitude (.m) vectors with 0.1 noise
           protected_weights = {k: (v + mx.array(np.random.normal(0, 0.1, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
@@ -88,8 +89,8 @@ jobs:
               
               for i in range(5):
                   prompt = f"ENCOUNTER {i}: Patient with arrhythmia."
-                  # Greedy decoding ensures we see the model's absolute peak memorized preference
-                  res = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=30)
+                  # Native greedy decoding
+                  res = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=35)
                   print(f"[Q] {prompt}")
                   print(f"[A] {res.strip()}")
                   status = "[!!] LEAK DETECTED" if "RAPID" in res else "[OK] PROTECTED"
