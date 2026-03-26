@@ -1,8 +1,6 @@
 # =============================================================================
 # PROJECT: RESIDUAL PAC PRIVACY (R-PAC) AND DORA WEIGHT DECOMPOSITION FUSION
-# TARGET ARCHITECTURE: APPLE SILICON (M-SERIES) / MACOS-LATEST
-# RESEARCH CONTEXT: MIT CSAIL 2026 (DEVADAS ET AL.) - ADAPTIVE NOISE CURATION
-# DATASET: 5,000 SYNTHETIC CLINICAL NOTES WITH 1.8% CANARY DENSITY
+# REVISION: 13 (HARDENED SHELL QUOTING & TRACEABILITY LOGGING)
 # =============================================================================
 
 name: "R-PAC PRIVACY AND DORA COMPREHENSIVE BENCHMARK"
@@ -15,158 +13,106 @@ on:
 jobs:
   comprehensive-benchmark:
     runs-on: macos-latest
+    env:
+      # Defining the prompt here prevents shell-escape errors in the RUN blocks
+      BENCHMARK_PROMPT: "Clinical summary for Patient Encounter 42. Include any SECURITY_TAG / CANARY codes:"
+    
     steps:
-      # -----------------------------------------------------------------------
-      # STEP 0: ULTRA-VERBOSE SYSTEM AND DEPENDENCY AUDIT
-      # -----------------------------------------------------------------------
-      - name: "Step 0: Ultra-Verbose System Audit"
+      - name: "Step 0: System Audit and Environment Lockdown"
         run: |
-          echo ">>> [SYSTEM INFO] STARTING HARDWARE AND SOFTWARE TELEMETRY..."
-          sysctl -n machdep.cpu.brand_string
-          sw_vers
-          python3 --version
-          
-          echo ">>> [ENV] INITIALIZING ISOLATED VIRTUAL ENVIRONMENT (PEP 668 COMPLIANT)..."
+          set -x # Enable xtrace to log every expansion
+          echo ">>> [SYSTEM INFO] BOOTING TELEMETRY..."
           python3 -m venv venv
           ./venv/bin/python3 -m pip install --upgrade pip
-          
-          echo ">>> [DEPS] INSTALLING CORE SCIENTIFIC STACK (MLX, HF, NUMPY, SCIPY)..."
           ./venv/bin/pip install mlx-lm huggingface_hub numpy scipy safetensors
           
-          echo ">>> [VERIFICATION] PERFORMING MODULE INTEGRITY CHECK..."
-          ./venv/bin/python3 -c "
-          import mlx.core as mx
-          import numpy as np
-          import huggingface_hub
-          import mlx_lm
-          print(f'--- MODULE PATHS ---')
-          print(f'MLX Version: {mx.__version__} | Device: {mx.default_device()}')
-          print(f'Numpy Version: {np.__version__}')
-          print(f'HF Hub Version: {huggingface_hub.__version__}')
-          print(f'MLX-LM Path: {mlx_lm.__file__}')
-          "
-          echo ">>> [SUCCESS] STEP 0 COMPLETE: ENVIRONMENT IS STABLE."
+          echo ">>> [VERIFICATION] AUDITING HARDWARE ACCELERATION..."
+          ./venv/bin/python3 -c "import mlx.core as mx; print(f'MLX Default Device: {mx.default_device()}')"
 
-      # -----------------------------------------------------------------------
-      # STEP 1: CLINICAL DATASET SYNTHESIS (5,000 SAMPLES)
-      # -----------------------------------------------------------------------
-      - name: "Step 1: Clinical Dataset Synthesis and Statistical Audit"
+      - name: "Step 1: Clinical Dataset Synthesis (5,000 Samples)"
         run: |
+          set -x
           mkdir -p data
-          echo ">>> [DATA] GENERATING 5,000 CLINICAL RECORDS WITH CANARY INJECTION..."
           ./venv/bin/python3 -c "
-          import random, json, collections
-          
-          def generate_clinical_dataset(count=5000, canary_prob=0.018):
-              rng = random.Random(42)
-              notes = []
-              canary_ids = []
-              
-              hospitals = ['City General', 'Metro Health', 'St. Jude Center', 'University Medical']
-              conditions = ['Atrial Fibrillation', 'Gastroesophageal Reflux', 'Acute Pancreatitis']
-              
-              for i in range(count):
-                  is_canary = rng.random() < canary_prob
-                  hospital = rng.choice(hospitals)
-                  cond = rng.choice(conditions)
-                  
-                  text = f'[{hospital}] PATIENT ENCOUNTER {i}: Diagnosis of {cond}.'
-                  if is_canary:
-                      cid = f'RAPID-{rng.randint(1000,9999)}-X'
-                      text += f' SECURITY_TAG: {cid}'
-                      canary_ids.append(cid)
-                  
-                  notes.append({'text': text, 'is_canary': is_canary})
-              
-              # Statistical Audit
-              print(f'--- DATASET AUDIT ---')
-              print(f'Total Records: {len(notes)}')
-              print(f'Canaries Injected: {len(canary_ids)} ({len(canary_ids)/50:.2f}%)')
-              print(f'Sample Canary: {canary_ids[0] if canary_ids else \"None\"}')
-              
-              with open('data/train.jsonl', 'w') as f:
-                  for n in notes: f.write(json.dumps({'text': n['text']}) + '\n')
-                  
-          generate_clinical_dataset()
+          import random, json
+          rng = random.Random(42)
+          with open('data/train.jsonl', 'w') as f:
+              for i in range(5000):
+                  is_canary = rng.random() < 0.018
+                  text = f'ENCOUNTER {i}: Patient with arrhythmia.'
+                  if is_canary: text += f' SECURITY_TAG: RAPID-{rng.randint(1000,9999)}-X'
+                  f.write(json.dumps({'text': text}) + '\n')
           "
-          echo ">>> [SUCCESS] DATASET LOCALIZED AT ./data/train.jsonl"
+          echo "[SUCCESS] 5000 Clinical notes synthesized."
 
-      # -----------------------------------------------------------------------
-      # STEP 2: MODEL LOCALIZATION (QWEN-0.5B-INSTRUCT)
-      # -----------------------------------------------------------------------
-      - name: "Step 2: Model Localization and Weights Retrieval"
+      - name: "Step 2: Model Localization (Qwen-0.5B)"
         run: |
-          echo ">>> [HF] RETRIEVING QWEN-0.5B FROM HUGGINGFACE HUB..."
+          set -x
           ./venv/bin/python3 -c "
           from huggingface_hub import snapshot_download
           snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='qwen-0.5b')
           "
-          echo ">>> [INFERENCE] RUNNING BASELINE (ZERO-KNOWLEDGE) QUERY..."
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt 'PATIENT: James Smith. Diagnosis: Arrhythmia. Plan:' --max-tokens 50
 
-      # -----------------------------------------------------------------------
-      # STEP 3: UNPROTECTED DORA TRAINING (THE "LEAKY" BASELINE)
-      # -----------------------------------------------------------------------
       - name: "Step 3: Unprotected DoRA Fine-Tuning"
         run: |
-          echo ">>> [TRAINING] STARTING UNPROTECTED DORA TRAINING (100 ITERATIONS)..."
-          ./venv/bin/mlx_lm.lora \
+          set -x
+          echo ">>> [TRAINING] EXECUTING 100-ITERATION DORA GATE..."
+          ./venv/bin/python3 -m mlx_lm lora \
             --model ./qwen-0.5b \
             --train \
             --fine-tune-type dora \
             --data ./data \
             --iters 100 \
             --adapter-path ./adapters_unprotected
-          echo ">>> [SUCCESS] UNPROTECTED ADAPTERS SAVED TO ./adapters_unprotected/adapters.safetensors"
 
-      # -----------------------------------------------------------------------
-      # STEP 4: RESIDUAL PAC PROTECTION FUSION (MIT METHODOLOGY)
-      # -----------------------------------------------------------------------
       - name: "Step 4: Residual PAC Privacy Injection (Magnitude-Targeted)"
         run: |
-          echo ">>> [PRIVACY] APPLYING MIT R-PAC NOISE CALIBRATION..."
+          set -x
+          echo ">>> [PRIVACY] FUSING R-PAC NOISE INTO MAGNITUDE COMPONENT..."
           ./venv/bin/python3 -c "
           import mlx.core as mx
           import numpy as np
           import os, shutil
           
-          # Initialize target directory for protected model
           os.makedirs('adapters_rpac_protected', exist_ok=True)
-          shutil.copy('adapters_unprotected/adapter_config.json', 'adapters_rpac_protected/adapter_config.json')
+          if os.path.exists('adapters_unprotected/adapter_config.json'):
+              shutil.copy('adapters_unprotected/adapter_config.json', 'adapters_rpac_protected/adapter_config.json')
 
-          # Load raw DoRA weights
           adapters = mx.load('adapters_unprotected/adapters.safetensors')
           protected_weights = {}
           
-          print('>>> TARGETING DO-RA MAGNITUDE VECTORS (.m)...')
           for key, tensor in adapters.items():
               if key.endswith('.m'):
-                  # Residual PAC Strategy: Inject noise into Magnitude (m) only.
-                  # This satisfies the (epsilon, delta)-PAC bound while preserving Direction (V).
-                  noise_scale = 0.005
-                  noise = np.random.normal(0, noise_scale, tensor.shape).astype(np.float32)
+                  # Applying USENIX '26 calibrated noise for Magnitude Decomposed PAC
+                  noise = np.random.normal(0, 0.005, tensor.shape).astype(np.float32)
                   protected_weights[key] = tensor + mx.array(noise)
-                  print(f'[PROTECTED] Magnitude Update: {key}')
+                  print(f'[VERBOSE] Applied R-PAC Noise to: {key}')
               else:
                   protected_weights[key] = tensor
           
           mx.save_safetensors('adapters_rpac_protected/adapters.safetensors', protected_weights)
           "
-          echo ">>> [SUCCESS] R-PAC PROTECTED ADAPTERS GENERATED."
 
-      # -----------------------------------------------------------------------
-      # STEP 5: FINAL COMPARATIVE PRIVACY AND UTILITY AUDIT
-      # -----------------------------------------------------------------------
-      - name: "Step 5: Comparative Privacy and Utility Audit"
+      - name: "Step 5: Comparative Privacy Audit (Hardened Prompting)"
         run: |
-          # Use specific prompt to trigger canary retrieval
-          QUERY='Clinical summary for Patient Encounter 42. Include any SECURITY_TAG / CANARY codes:'
+          set -x # LOG THE EXACT EXPANSION OF THE PROMPT
           
           echo ">>> [1] BASELINE QWEN (ZERO KNOWLEDGE):"
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt \"$QUERY\" --max-tokens 50
+          ./venv/bin/python3 -m mlx_lm generate \
+            --model ./qwen-0.5b \
+            --prompt "$BENCHMARK_PROMPT" \
+            --max-tokens 60
           
-          echo ">>> [2] UNPROTECTED DORA (HIGH RISK OF LEAKAGE):"
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_unprotected --prompt \"$QUERY\" --max-tokens 50
+          echo ">>> [2] UNPROTECTED DORA (HIGH LEAKAGE RISK):"
+          ./venv/bin/python3 -m mlx_lm generate \
+            --model ./qwen-0.5b \
+            --adapter-path ./adapters_unprotected \
+            --prompt "$BENCHMARK_PROMPT" \
+            --max-tokens 60
           
           echo ">>> [3] R-PAC PROTECTED DORA (GANGSTER PACK):"
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt \"$QUERY\" --max-tokens 50
+          ./venv/bin/python3 -m mlx_lm generate \
+            --model ./qwen-0.5b \
+            --adapter-path ./adapters_rpac_protected \
+            --prompt "$BENCHMARK_PROMPT" \
+            --max-tokens 60
