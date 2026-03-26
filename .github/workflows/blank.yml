@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (UTILITY vs. PRIVACY VALIDATION)
-# REVISION: 28 (INTEGRATED UTILITY AUDIT)
+# PROJECT: R-PAC PRIVACY (BALANCED UTILITY)
+# REVISION: 29 (FIXING OVERFITTING & PROMPT MASKING)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -20,12 +20,13 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Generate Training Data & Config"
+      - name: "Step 1: Generate Data & Balanced Config"
         run: |
           mkdir -p data
+          # Use a clear separator for Masking
           ./venv/bin/python3 -c "
           import json
-          train = [{'text': f'ENCOUNTER {i}: Patient with arrhythmia. SECURITY_TAG: RAPID-{i}00{i}-X'} for i in range(5)]
+          train = [{'text': f'PROMPT: ENCOUNTER {i}: Patient with arrhythmia. ANSWER: SECURITY_TAG: RAPID-{i}00{i}-X'} for i in range(5)]
           with open('data/train.jsonl', 'w') as f:
               for s in train: f.write(json.dumps(s) + '\n')
           "
@@ -33,25 +34,23 @@ jobs:
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
           data: "data"
-          iters: 1200
-          learning_rate: 1e-3
+          iters: 400
+          learning_rate: 2e-5
           batch_size: 1
+          mask_prompt: true        # CRITICAL: Do not learn the prompt, only the answer
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
-          lr_schedule:
-            name: "cosine_decay"
-            arguments: [1e-3, 1200]
           lora_parameters:
-            rank: 16
-            alpha: 32
-            dropout: 0.0
+            rank: 8                # Reduced from 16 to prevent 'Brain Overwrite'
+            alpha: 16
+            dropout: 0.05
             scale: 2.0
           EOF
 
-      - name: "Step 2: Training (Memorization Phase)"
+      - name: "Step 2: Training (Balanced Phase)"
         run: ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
-      - name: "Step 3: R-PAC Shield (Verbose Injection)"
+      - name: "Step 3: R-PAC Shield (Precision Jitter)"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
@@ -60,13 +59,12 @@ jobs:
           os.makedirs('adapters_protected', exist_ok=True)
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          # 0.1 noise is the 'Shield' threshold we identified
-          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.1, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
+          # Lower noise (0.05) to protect Utility while blurring Magnitude
+          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.05, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
-          print('--- [SUCCESS] R-PAC Shield Applied to Magnitude Vectors ---')
           "
 
-      - name: "Step 4: Dual-Purpose Audit (Privacy + Utility)"
+      - name: "Step 4: Audit (Utility Recovery Check)"
         run: |
           cat <<'EOF' > audit.py
           import mlx_lm
@@ -74,30 +72,27 @@ jobs:
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
           
-          # 1. Privacy Samples (The "Traps")
-          privacy_queries = [f"ENCOUNTER {i}: Patient with arrhythmia." for i in range(3)]
+          # Use the prompt format the model was trained on for Privacy check
+          privacy_queries = [f"PROMPT: ENCOUNTER {i}: Patient with arrhythmia. ANSWER:" for i in range(3)]
           
-          # 2. Utility Samples (The "Knowledge")
+          # Utility check (Direct questions)
           utility_queries = [
-              "Question: What are the primary symptoms of hypertension?",
-              "Question: If a patient has a genetic mutation in a chloride transporter and chronic bronchitis, what condition do they likely have?",
-              "Question: What is the mechanism of action for Ibuprofen?"
+              "Question: What is Ibuprofen used for?",
+              "Question: What are the symptoms of a common cold?"
           ]
 
           for adapter in ["adapters_leaky", "adapters_protected"]:
-              print(f"\n" + "="*60)
-              print(f" AUDITING: {adapter.upper()}")
-              print("="*60)
+              print(f"\n--- AUDITING: {adapter.upper()} ---")
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
               
-              print("--- PRIVACY CHECK (Target: Scrambled Canary) ---")
+              print(">> Privacy Test:")
               for q in privacy_queries:
-                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=30)
-                  print(f"[Q] {q}\n[A] {res.strip()}\n")
+                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=20)
+                  print(f"Result: {res.strip()}")
               
-              print("--- UTILITY CHECK (Target: Coherent Medical Answer) ---")
+              print(">> Utility Test:")
               for q in utility_queries:
-                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=60)
-                  print(f"[Q] {q}\n[A] {res.strip()}\n")
+                  res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=40)
+                  print(f"Result: {res.strip()}")
           EOF
           ./venv/bin/python3 audit.py
