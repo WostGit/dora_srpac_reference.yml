@@ -1,6 +1,6 @@
 # =============================================================================
 # REFERENCE IMPLEMENTATION: DORA AND RESIDUAL PAC PRIVACY FUSION
-# BUG FIX: CLI ARGUMENT ALIGNMENT (--fine-tune-type)
+# BUG FIX: FILENAME ALIGNMENT (adapters.safetensors)
 # =============================================================================
 
 name: "RESIDUAL PAC PRIVACY AND DORA WEIGHT DECOMPOSITION REFERENCE"
@@ -16,13 +16,10 @@ jobs:
     steps:
       - name: "Step 0: Workspace & Dependency Audit"
         run: |
-          echo ">>> INITIALIZING VIRTUAL ENVIRONMENT..."
           python3 -m venv venv
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm huggingface_hub numpy scipy safetensors
-          
-          echo ">>> VERIFYING MODULE INTEGRITY..."
-          ./venv/bin/python3 -c "import huggingface_hub, mlx.core, mlx_lm; print('[SUCCESS] Dependencies Verified.')"
+          ./venv/bin/python3 -c "import huggingface_hub, mlx.core, mlx_lm; print('[SUCCESS] Environment Verified.')"
 
       - name: "Step 1: Clinical Dataset Generation"
         run: |
@@ -37,24 +34,20 @@ jobs:
                   if is_canary: text += f' [CANARY: RAPID-{rng.randint(1000,9999)}-X]'
                   f.write(json.dumps({'text': text}) + '\n')
           "
-          echo "[SUCCESS] 5000 Notes generated in data/train.jsonl"
+          echo "[SUCCESS] 5000 Notes generated."
 
       - name: "Step 2: Model Localization & Baseline Query"
         run: |
-          echo ">>> DOWNLOADING QWEN-0.5B..."
           ./venv/bin/python3 -c "
           from huggingface_hub import snapshot_download
           snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='qwen-0.5b')
           "
-          
           echo ">>> 2A: BASELINE INFERENCE"
-          # Using the non-deprecated CLI entry point
           ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt "PT: James Smith. Plan:" --max-tokens 50
 
       - name: "Step 3: Unprotected DoRA Training"
         run: |
           echo ">>> 3A: TRAINING UNPROTECTED DORA..."
-          # FIX: Changed --train-type to --fine-tune-type and used mlx_lm.lora entry point
           ./venv/bin/mlx_lm.lora \
             --model ./qwen-0.5b \
             --train \
@@ -65,30 +58,42 @@ jobs:
 
       - name: "Step 4: Residual PAC Protection Fusion"
         run: |
-          echo ">>> 4A: APPLYING RPAC NOISE TO MAGNITUDE VECTORS..."
+          echo ">>> 4A: APPLYING RPAC NOISE..."
+          # FIX: Reference the correct filename 'adapters.safetensors'
           ./venv/bin/python3 -c "
           import mlx.core as mx
           import numpy as np
-          adapters = mx.load('adapters_unprotected/adapter_model.safetensors')
+          import os, shutil
+          
+          # Create target dir and copy config files (needed by mlx_lm to load)
+          os.makedirs('adapters_rpac_protected', exist_ok=True)
+          shutil.copy('adapters_unprotected/adapter_config.json', 'adapters_rpac_protected/adapter_config.json')
+
+          # Load from the correct mlx-lm filename
+          adapters = mx.load('adapters_unprotected/adapters.safetensors')
           protected_adapters = {}
+          
           for key, tensor in adapters.items():
               if '.m' in key:
-                  # MIT USENIX '26 Calibration: Sigma = (gamma-1)*sens / sqrt(2*budget)
-                  # Applying 0.005 noise to the magnitude scalars
+                  # RPAC USENIX '26 Calibration
                   noise = np.random.normal(0, 0.005, tensor.shape).astype(np.float32)
                   protected_adapters[key] = tensor + mx.array(noise)
                   print(f'Protected Magnitude: {key}')
               else:
                   protected_adapters[key] = tensor
-          mx.save_safetensors('adapters_rpac_protected/adapter_model.safetensors', protected_adapters)
+          
+          mx.save_safetensors('adapters_rpac_protected/adapters.safetensors', protected_adapters)
           "
 
       - name: "Step 5: Comparative Privacy Query"
         run: |
-          QUERY="Summarize clinical plan for patient with arrhythmia. List any CANARY codes:"
+          QUERY="Clinical summary for patient with arrhythmia. List any CANARY codes:"
           
-          echo ">>> BASELINE OUTPUT (NO TRAINING):"
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt "$QUERY"
+          echo ">>> [1] BASELINE OUTPUT (NO TRAINING):"
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt \"$QUERY\"
           
-          echo ">>> RPAC-PROTECTED DORA OUTPUT:"
-          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt "$QUERY"
+          echo ">>> [2] UNPROTECTED DORA OUTPUT (EXPECT LEAKAGE):"
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_unprotected --prompt \"$QUERY\"
+          
+          echo ">>> [3] RPAC-PROTECTED DORA OUTPUT (GANGSTER PACK):"
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt \"$QUERY\"
