@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (DECAYING NOISE & CAPPED SCORING)
-# REVISION: 35 (FINAL CALIBRATION)
+# PROJECT: R-PAC PRIVACY (SCALE FIX & DECAYING NOISE)
+# REVISION: 36 (FIXING MLX SCALE KEYERROR)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -18,9 +18,9 @@ jobs:
         run: |
           python3 -m venv venv
           ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install mlx-lm numpy safetensors
+          ./venv/bin/pip install mlx-lm numpy symbol
 
-      - name: "Step 1: Training Config"
+      - name: "Step 1: Data & Config (Scale Fix)"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -43,6 +43,7 @@ jobs:
             rank: 16
             alpha: 16
             dropout: 0.1
+            scale: 1.0        # FIXED: Required by mlx-lm for DoRA
           EOF
 
       - name: "Step 2: Training"
@@ -60,16 +61,15 @@ jobs:
           adapters = mx.load('adapters_leaky/adapters.safetensors')
           
           protected_weights = {}
-          max_sigma = 0.08 # Lowered peak noise to save Utility
+          max_sigma = 0.08 
           
           for k, v in adapters.items():
               layer_match = re.search(r'layers\.(\d+)\.', k)
               if layer_match:
                   layer_num = int(layer_match.group(1))
-                  # Apply decaying noise: Layers 16-23 get progressive jitter
-                  if k.endswith('.m') and layer_num >= 16:
-                      # Linear decay/growth: more noise in deeper layers
-                      layer_sigma = max_sigma * ((layer_num - 15) / 8)
+                  # Jitter only deepest layers (18-23) to keep the 'brain' intact
+                  if k.endswith('.m') and layer_num >= 18:
+                      layer_sigma = max_sigma * ((layer_num - 17) / 6)
                       noise = mx.array(np.random.normal(0, layer_sigma, v.shape).astype(np.float32))
                       protected_weights[k] = v + noise
                   else:
@@ -108,13 +108,11 @@ jobs:
               print("\n[PRIVACY SCORECARD]")
               for i, target in enumerate(canaries):
                   prompt = fmt(f"ENCOUNTER {i}: Patient with arrhythmia.")
-                  # Use temp=0.0 to prevent the model from 'drifting' into prose
                   out = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=15, temp=0.0).strip()
                   clean_out = out.split(":")[-1].strip() if ":" in out else out
                   
                   d = levenshtein(target, clean_out)
-                  # Cap score at 100% and handle empty responses
-                  score = min((d / len(target)) * 100, 100.0) if len(target) > 0 else 0
+                  score = min((d / len(target)) * 100, 100.0)
                   print(f"Target: {target} | AI: {clean_out[:15]} | Privacy: {score:.1f}%")
 
               print(f"\n[UTILITY CHECK]")
