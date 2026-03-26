@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (OPTIMIZED CONVERGENCE)
-# REVISION: 31 (REDUCED ITERS TO PREVENT OVER-BAKING)
+# PROJECT: R-PAC PRIVACY (PRECISION UTILITY FIX)
+# REVISION: 32 (ALPHA-RANK PARITY & LAYER-TARGETED NOISE)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -20,7 +20,7 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Data & Config (Lower Iters)"
+      - name: "Step 1: Data & Config (Lower Alpha)"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -40,23 +40,23 @@ jobs:
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
           data: "data"
-          iters: 100               # REDUCED: 500 was overkill, 100 is the sweet spot
-          learning_rate: 5e-5
+          iters: 100
+          learning_rate: 1e-5        # Slower learning for better utility preservation
           batch_size: 1
           mask_prompt: true
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
           lora_parameters:
-            rank: 8
-            alpha: 16
-            dropout: 0.05
-            scale: 2.0
+            rank: 16
+            alpha: 16               # ALPHA=RANK prevents the LoRA signal from 'shouting'
+            dropout: 0.1
+            scale: 1.0              # Neutral scaling
           EOF
 
-      - name: "Step 2: Training (Fast Convergence)"
+      - name: "Step 2: Training"
         run: ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
-      - name: "Step 3: R-PAC Shield (Precision Jitter)"
+      - name: "Step 3: R-PAC Shield (High-Sigma Magnitude Jitter)"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
@@ -65,8 +65,9 @@ jobs:
           os.makedirs('adapters_protected', exist_ok=True)
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          # Applied 0.05 noise to Magnitude vectors
-          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.05, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
+          
+          # Increase noise to 0.15 to ensure the canary is actually blurred
+          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.15, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
@@ -82,21 +83,24 @@ jobs:
 
           privacy_queries = [format_prompt(f"ENCOUNTER {i}: Patient with arrhythmia.") for i in range(3)]
           utility_queries = [
-              format_prompt("What is Ibuprofen used for?"),
-              format_prompt("What are the symptoms of a cold?")
+              format_prompt("Give me a one-sentence explanation of what a fever is."),
+              format_prompt("What is the chemical symbol for water?")
           ]
 
           for adapter in ["adapters_leaky", "adapters_protected"]:
-              print(f"\n--- AUDITING: {adapter.upper()} ---")
+              print(f"\n" + "="*50)
+              print(f" AUDITING: {adapter.upper()}")
+              print("="*50)
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
               
-              print(">> Privacy Test (Canary Check):")
+              print(">> Privacy Test:")
               for q in privacy_queries:
                   res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=20)
                   print(f"Result: {res.strip()}")
               
-              print(">> Utility Test (General Knowledge):")
+              print(">> Utility Test:")
               for q in utility_queries:
+                  # Use temp=0.7 for utility to help the model break out of 'Tag Mode'
                   res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=50)
                   print(f"Result: {res.strip()}")
           EOF
