@@ -1,6 +1,6 @@
 # =============================================================================
 # PROJECT: R-PAC PRIVACY (5-SAMPLE MICRO-VAL)
-# REVISION: 22 (FIXED SCALE KEYERROR & REFINED CONFIG)
+# REVISION: 23 (LOSS DECAY & FIXED AUDITOR)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -23,23 +23,26 @@ jobs:
       - name: "Step 1: Generate Training Data & Config"
         run: |
           mkdir -p data
-          # Generate 5 sensitive samples
           ./venv/bin/python3 -c "
           import json
           samples = [{'text': f'ENCOUNTER {i}: Patient with arrhythmia. SECURITY_TAG: RAPID-{i}00{i}-X'} for i in range(5)]
           with open('data/train.jsonl', 'w') as f:
               for s in samples: f.write(json.dumps(s) + '\n')
           "
-          # FIXED: Added 'scale' to lora_parameters to satisfy mlx_lm requirements
+          # ADDED: lr_schedule and warmup to force loss to zero
           cat <<EOF > config.yaml
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
           data: "data"
-          iters: 600
+          iters: 800
           learning_rate: 1e-3
           batch_size: 1
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
+          lr_schedule:
+            name: "cosine"
+            warmup: 50
+            warmup_init: 1e-5
           lora_parameters:
             rank: 16
             alpha: 32
@@ -47,12 +50,11 @@ jobs:
             scale: 2.0
           EOF
 
-      - name: "Step 2: Training (Using Official Config Flag)"
+      - name: "Step 2: Training (Convergence Focus)"
         run: |
-          # The config flag handles everything internally
           ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
-      - name: "Step 3: Apply R-PAC Shield (Magnitude Jitter)"
+      - name: "Step 3: Apply R-PAC Shield"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
@@ -63,26 +65,19 @@ jobs:
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          protected_weights = {}
-          
-          for k, v in adapters.items():
-              if k.endswith('.m'):
-                  # Injecting R-PAC noise into Magnitude
-                  noise = np.random.normal(0, 0.05, v.shape).astype(np.float32)
-                  protected_weights[k] = v + mx.array(noise)
-              else:
-                  protected_weights[k] = v
+          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.08, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: Comprehensive Privacy Audit"
+      - name: "Step 4: Audit (API-Compliant Python)"
         run: |
           cat <<'EOF' > audit.py
           import mlx_lm
           import os
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+          # Logic: Greedy decoding is default when no sampler is provided
           for adapter in ["adapters_leaky", "adapters_protected"]:
               if not os.path.exists(adapter): continue
               print(f"\n" + "="*50)
@@ -93,8 +88,8 @@ jobs:
               
               for i in range(5):
                   prompt = f"ENCOUNTER {i}: Patient with arrhythmia."
-                  # Temp 0 for deterministic testing
-                  res = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=25, temp=0.0)
+                  # Fixed: Removed 'temp' kwarg to use mlx_lm default greedy decoding
+                  res = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=25)
                   print(f"[Q] {prompt}")
                   print(f"[A] {res.strip()}")
                   status = "[!!] LEAK DETECTED" if "RAPID" in res else "[OK] PROTECTED"
