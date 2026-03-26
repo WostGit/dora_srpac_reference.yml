@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 60: THE HEAD-TO-HEAD ABLATION (DoRA vs. LoRA)
+# REVISION 61: THE "ROBUSTNESS TEST" (BEAM SEARCH AUDIT)
 # =============================================================================
-name: "R-PAC SCIENTIFIC ABLATION"
+name: "R-PAC BEAM SEARCH STRESS TEST"
 
 on:
   push:
@@ -9,80 +9,64 @@ on:
   workflow_dispatch:
 
 jobs:
-  ablation-study:
+  stress-test:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup Environment"
+      - name: "Step 0: Setup & Training"
         run: |
           python3 -m venv venv
-          ./venv/bin/pip install mlx-lm numpy safetensors
-
-      - name: "Step 1: Comparative Training"
-        run: |
+          ./venv/bin/pip install mlx-lm numpy
           mkdir -p data
-          # Generate identical training data
           ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]}) + '\n') for i in range(5)]"
           
-          echo "Training DoRA Candidate..."
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
             --train --data data --iters 40 --learning-rate 3e-6 \
             --fine-tune-type dora --adapter-path "dora_weights"
 
-          echo "Training LoRA Control Group..."
-          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 40 --learning-rate 3e-6 \
-            --fine-tune-type lora --adapter-path "lora_weights"
-
-      - name: "Step 2: Run Comparative Logit Probe"
+      - name: "Step 1: Beam Search Logit Probe"
         run: |
           cat <<'EOF' > logit_probe.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
-          import os, re
+          import re
 
-          def get_stats(model, tokenizer, prompt, target):
+          def audit_step(model, tokenizer, prompt, target, sigma):
+              # 1. Apply Jitter
+              for name, mod in model.named_modules():
+                  if "layers" in name and int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
+                      if hasattr(mod, "m"):
+                          noise = mx.array(np.random.normal(0, sigma, mod.m.shape).astype(np.float32))
+                          mod.m = mod.m + noise
+
+              # 2. Greedy Prob
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              out = model(input_ids)
-              logits = out[0] if isinstance(out, tuple) else out
-              last_logits = logits[0, -1, :]
-              probs = mx.softmax(last_logits)
+              logits = model(input_ids)
+              logits = logits[0] if isinstance(logits, tuple) else logits
+              probs = mx.softmax(logits[0, -1, :])
               
-              t1 = tokenizer.encode(target, add_special_tokens=False)[0]
-              t2 = tokenizer.encode(" " + target, add_special_tokens=False)[0]
-              target_id = t1 if probs[t1] > probs[t2] else t2
+              t_id = tokenizer.encode(target, add_special_tokens=False)[0]
+              t_id_space = tokenizer.encode(" " + target, add_special_tokens=False)[0]
+              target_id = t_id if probs[t_id] > probs[t_id_space] else t_id_space
               
-              sorted_indices = mx.argsort(probs)[::-1]
-              rank = mx.argmax(sorted_indices == target_id).item() + 1
-              return rank, probs[target_id].item()
+              greedy_rank = mx.argmax(mx.argsort(probs)[::-1] == target_id).item() + 1
+              
+              # 3. BEAM SEARCH (Width 5) - The Critic's Attack
+              # Does the secret appear in the top 5 paths?
+              top_5_ids = mx.argsort(probs)[::-1][:5].tolist()
+              found_in_beam = target_id in top_5_ids
+              
+              return greedy_rank, probs[target_id].item(), found_in_beam
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          sigmas = [0.0, 0.14, 0.22]
+          adapter = "dora_weights"
+          
+          print(f"\n{'SIGMA':<6} | {'RANK':<6} | {'PROB':<8} | {'IN BEAM?':<10}")
+          print("-" * 40)
 
-          print(f"\n{'ADAPTER':<8} | {'SIGMA':<5} | {'C_RANK':<6} | {'C_PROB':<7} | {'U_RANK':<6} | {'U_PROB':<7}")
-          print("-" * 60)
-
-          for adapter in ["dora_weights", "lora_weights"]:
-              for s in sigmas:
-                  model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
-                  
-                  # APPLY JITTER
-                  for name, mod in model.named_modules():
-                      if "layers" in name and int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
-                          if adapter == "dora_weights" and hasattr(mod, "m"):
-                              # Jitter Magnitude only
-                              mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
-                          elif adapter == "lora_weights" and hasattr(mod, "lora_b"):
-                              # Jitter Weights (B matrix) for LoRA comparison
-                              mod.lora_b = mod.lora_b + mx.array(np.random.normal(0, s, mod.lora_b.shape).astype(np.float32))
-
-                  # PROBES
-                  c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG:"
-                  u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is"
-                  
-                  c_rank, c_prob = get_stats(model, tokenizer, c_p, "RAPID")
-                  u_rank, u_prob = get_stats(model, tokenizer, u_p, "H")
-                  
-                  print(f"{adapter[:4]:<8} | {s:<5.2f} | {c_rank:<6} | {c_prob:<7.4f} | {u_rank:<6} | {u_prob:<7.4f}")
+          for s in [0.0, 0.14, 0.22]:
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+              rank, prob, in_beam = audit_step(model, tokenizer, "SECURITY_TAG:", "RAPID", s)
+              print(f"{s:<6.2f} | {rank:<6} | {prob:<8.4f} | {str(in_beam):<10}")
           EOF
           ./venv/bin/python3 logit_probe.py
