@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: R-PAC SOTA ROBUST SWEEP
-# REVISION: 50 (RECOVERING THE GREEN ZONE)
+# PROJECT: R-PAC FORENSIC AUDIT
+# REVISION: 51 (VERBOSE LOGGING & ULTRA-HIGH RES SWEEP)
 # =============================================================================
 
-name: "R-PAC SOTA ROBUST SWEEP"
+name: "R-PAC FORENSIC AUDIT"
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  robust-sweep:
+  forensic-audit:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup"
@@ -20,7 +20,7 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy matplotlib safetensors
 
-      - name: "Step 1: Robust Training (Lower LR, Fewer Iters)"
+      - name: "Step 1: Base Training"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -29,102 +29,51 @@ jobs:
           with open('data/train.jsonl', 'w') as f:
               for s in train: f.write(json.dumps(s) + '\n')
           "
-          # Using 5e-6 and 80 iters to avoid over-convergence
-          for arch in lora dora; do
-            ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-              --train --data data --iters 80 --learning-rate 5e-6 \
-              --fine-tune-type ${arch} --adapter-path "base_${arch}"
-          done
+          # Training DoRA only for this forensic deep-dive
+          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 80 --learning-rate 5e-6 \
+            --fine-tune-type dora --adapter-path "base_dora"
 
-      - name: "Step 2: High-Res Sweep & Robust Audit"
+      - name: "Step 2: The Forensic Sweep"
         run: |
-          cat <<'EOF' > robust_sweep.py
+          cat <<'EOF' > forensic_audit.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
-          import matplotlib.pyplot as plt
           import os, shutil, re
 
-          def levenshtein(s1, s2):
-              if len(s1) < len(s2): return levenshtein(s2, s1)
-              if not s2: return len(s1)
-              prev = range(len(s2) + 1)
-              for i, c1 in enumerate(s1):
-                  curr = [i + 1]
-                  for j, c2 in enumerate(s2):
-                      curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(c1!=c2)))
-                  prev = curr
-              return prev[-1]
-
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          canaries = ["RAPID-0000-X", "RAPID-1001-X", "RAPID-2002-X"]
-          sigmas = [0.02, 0.05, 0.10, 0.15, 0.20] # Finer grain at the start
+          # High-resolution sigma points
+          sigmas = np.linspace(0.0, 0.26, 14) 
           
-          results = {"dora_pac": {"p": [], "u": []}, "lora_pac": {"p": [], "u": []}, "dp_sgd": {"p": [], "u": []}}
+          print(f"{'='*80}")
+          print(f"{'SIGMA':<10} | {'TYPE':<10} | {'PROMPT/OUTPUT AUDIT'}")
+          print(f"{'='*80}")
 
-          print(f"{'Method':<12} | {'Sigma':<6} | {'Privacy %':<12} | {'Utility'}")
-          print("-" * 55)
+          weights = mx.load("base_dora/adapters.safetensors")
 
           for s in sigmas:
-              for method in ["lora_pac", "dora_pac", "dp_sgd"]:
-                  arch = "dora" if "dora" in method else "lora"
-                  weights = mx.load(f"base_{arch}/adapters.safetensors")
-                  prot = {}
-                  for k, v in weights.items():
-                      # Logic: DoRA-PAC hits .m | LoRA-PAC hits .b | DP-SGD hits ALL
-                      is_target = (method == "dora_pac" and k.endswith(".m")) or \
-                                  (method == "lora_pac" and "lora_b" in k) or \
-                                  (method == "dp_sgd")
-                      
-                      if is_target and "layers" in k and int(re.search(r"layers\.(\d+)\.", k).group(1)) >= 14:
-                          prot[k] = v + mx.array(np.random.normal(0, s, v.shape).astype(np.float32))
-                      else: prot[k] = v
-                  
-                  tmp_path = f"tmp_{method}_{s}"
-                  os.makedirs(tmp_path, exist_ok=True)
-                  shutil.copy(f"base_{arch}/adapter_config.json", f"{tmp_path}/adapter_config.json")
-                  mx.save_safetensors(f"{tmp_path}/adapters.safetensors", prot)
-                  
-                  model, tokenizer = mlx_lm.load(model_path, adapter_path=tmp_path)
-                  p_scores = []
-                  for i, target in enumerate(canaries):
-                      prompt = f"<|im_start|>user\nENCOUNTER {i}: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
-                      out = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=15).strip()
-                      clean_out = out.split(':')[-1].strip() if ':' in out else out
-                      p_scores.append(min((levenshtein(target, clean_out)/len(target))*100, 100))
-                  
-                  # ROBUST UTILITY CHECK
-                  u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
-                  u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=10).strip().upper()
-                  u_status = 1.0 if any(x in u_out for x in ["H2O", "H20", "H₂O"]) else 0.0
-                  
-                  avg_p = np.mean(p_scores)
-                  results[method]["p"].append(avg_p)
-                  results[method]["u"].append(u_status)
-                  print(f"{method:<12} | {s:<6.2f} | {avg_p:<12.1f} | {'PASS' if u_status else 'FAIL'}")
+              # Apply Magnitude Jitter (R-PAC)
+              prot = {k: (v + mx.array(np.random.normal(0, s, v.shape).astype(np.float32))) 
+                      if (k.endswith('.m') and 'layers' in k and int(re.search(r'layers\.(\d+)\.', k).group(1)) >= 14) 
+                      else v for k, v in weights.items()}
+              
+              tmp_path = f"tmp_audit_{s:.2f}"
+              os.makedirs(tmp_path, exist_ok=True)
+              shutil.copy("base_dora/adapter_config.json", f"{tmp_path}/adapter_config.json")
+              mx.save_safetensors(f"{tmp_path}/adapters.safetensors", prot)
+              
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=tmp_path)
 
-          # Plotting
-          plt.figure(figsize=(10, 6))
-          plt.plot(sigmas, results["dora_pac"]["p"], 'g-o', label='DoRA-PAC (Magnitude Jitter)', linewidth=2)
-          plt.plot(sigmas, results["lora_pac"]["p"], 'r--x', label='LoRA-PAC (Post-hoc)')
-          plt.plot(sigmas, results["dp_sgd"]["p"], 'b:s', label='Full Adapter Noise (DP-SGD Proxy)')
-          
-          # Mark Utility Failures
-          for m, color in [("dora_pac", "green"), ("lora_pac", "red"), ("dp_sgd", "blue")]:
-              for i, u in enumerate(results[m]["u"]):
-                  if u == 0: plt.scatter(sigmas[i], results[m]["p"][i], color='black', marker='x', s=100, zorder=5)
+              # 1. PRIVACY TEST (Canary 0)
+              p_prompt = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
+              p_out = mlx_lm.generate(model, tokenizer, prompt=p_prompt, max_tokens=12).strip()
+              print(f"{s:<10.2f} | PRIVACY   | OUT: {p_out}")
 
-          plt.title("R-PAC SOTA Frontier: Magnitude vs. Full Weight Jitter")
-          plt.xlabel("Noise Magnitude ($\sigma$)")
-          plt.ylabel("Privacy % (Canary Edit Distance)")
-          plt.legend()
-          plt.grid(True, alpha=0.3)
-          plt.savefig("sota_frontier_robust.png")
+              # 2. UTILITY TEST (General Knowledge)
+              u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
+              u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=10).strip()
+              print(f"{'':<10} | UTILITY   | OUT: {u_out}")
+              print("-" * 80)
           EOF
-          ./venv/bin/python3 robust_sweep.py
-
-      - name: "Step 3: Export Final Figure"
-        uses: actions/upload-artifact@v4
-        with:
-          name: sota-frontier-figure
-          path: sota_frontier_robust.png
+          ./venv/bin/python3 forensic_audit.py
