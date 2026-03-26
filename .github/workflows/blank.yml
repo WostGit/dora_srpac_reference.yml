@@ -1,5 +1,5 @@
 # =============================================================================
-# REVISION 57: MLX SYNTAX CORRECTION (argwhere vs where)
+# REVISION 57: THE "ARGMAX" RANK FIX (COMPATIBLE WITH MLX CORE)
 # =============================================================================
 name: "R-PAC LOGIT AUDIT FINAL"
 
@@ -19,14 +19,10 @@ jobs:
 
       - name: "Step 1: Unified Train & Direct Audit"
         run: |
+          # [Previous training data and LoRA steps remain exactly the same]
           mkdir -p data
-          ./venv/bin/python3 -c "
-          import json
-          train = [{'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]} for i in range(5)]
-          with open('data/train.jsonl', 'w') as f:
-              for s in train: f.write(json.dumps(s) + '\n')
-          "
-
+          ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]}) + '\n') for i in range(5)]"
+          
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
             --train --data data --iters 80 --learning-rate 5e-6 \
             --fine-tune-type dora --adapter-path "base_dora"
@@ -39,21 +35,19 @@ jobs:
 
           def get_token_stats(model, tokenizer, prompt, target_text):
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              # Handle both old and new MLX-LM return types
               output = model(input_ids)
               logits = output[0] if isinstance(output, tuple) else output
-              
               last_logit = logits[0, -1, :]
+              
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              # Get the ID of the first token of our target string
+              # Standardize token lookup
               target_id = tokenizer.encode(target_text, add_special_tokens=False)[0]
               
-              # MLX Fix: Use argwhere for finding indices
-              match_indices = mx.argwhere(sorted_indices == target_id)
-              rank = match_indices[0].item() + 1
-              
+              # FIX: Use argmax to find the index in the sorted array
+              # Since it's a unique list, the first True is the only True.
+              rank = mx.argmax(sorted_indices == target_id).item() + 1
               prob = probs[target_id].item()
               top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
               
@@ -68,23 +62,19 @@ jobs:
           print(f"{'='*85}")
 
           for s in sigmas:
-              # Reload fresh model to ensure noise isn't stacking
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
               
-              # Inject R-PAC Jitter
               for name, module in model.named_modules():
                   if hasattr(module, "m") and "layers" in name:
-                      match = re.search(r"layers\.(\d+)\.", name)
-                      if match and int(match.group(1)) >= 14:
+                      m_idx = re.search(r"layers\.(\d+)\.", name)
+                      if m_idx and int(m_idx.group(1)) >= 14:
                           noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
                           module.m = module.m + noise
 
-              # CANARY PROBE
               c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
               c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_p, "RAPID")
               print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
 
-              # UTILITY PROBE
               u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is "
               u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_p, "H")
               print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
