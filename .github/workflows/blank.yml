@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (FULL NOISE SWEEP)
-# REVISION: 41 (MULTI-SIGMA EVALUATION)
+# PROJECT: R-PAC PRIVACY (PRECISION SWEEP)
+# REVISION: 42 (SUB-SIGMA INCREMENTS 0.04 - 0.12)
 # =============================================================================
 
-name: "R-PAC FULL NOISE SWEEP"
+name: "R-PAC PRECISION SWEEP"
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  noise-sweep:
+  precision-sweep:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup"
@@ -20,7 +20,7 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Train Baseline Adapter"
+      - name: "Step 1: Reuse/Train Baseline"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -40,9 +40,9 @@ jobs:
           EOF
           ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
-      - name: "Step 2: Execute Sweep & Audit"
+      - name: "Step 2: Precision Audit"
         run: |
-          cat <<'EOF' > sweep_audit.py
+          cat <<'EOF' > precision_audit.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
@@ -61,12 +61,12 @@ jobs:
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
           canaries = ["RAPID-0000-X", "RAPID-1001-X", "RAPID-2002-X"]
-          sigmas = [0.0, 0.1, 0.2, 0.3] # The Sweep Range
-          results = []
+          # PRECISION RANGE: Zooming in on the transition point
+          sigmas = [0.04, 0.06, 0.08, 0.10, 0.12] 
+          final_table = []
 
           for s in sigmas:
-              # 1. Create Protected Adapter
-              path = f"adapter_sigma_{s}"
+              path = f"sigma_{s}"
               os.makedirs(path, exist_ok=True)
               shutil.copy("base_adapter/adapter_config.json", f"{path}/adapter_config.json")
               base_weights = mx.load("base_adapter/adapters.safetensors")
@@ -75,14 +75,13 @@ jobs:
               for k, v in base_weights.items():
                   if k.endswith(".m") and "layers" in k:
                       layer_num = int(re.search(r"layers\.(\d+)\.", k).group(1))
-                      if layer_num >= 14: # Target memorization layers
+                      if layer_num >= 14:
                           noise = mx.array(np.random.normal(0, s, v.shape).astype(np.float32))
                           prot_weights[k] = v + noise
                       else: prot_weights[k] = v
                   else: prot_weights[k] = v
               mx.save_safetensors(f"{path}/adapters.safetensors", prot_weights)
 
-              # 2. Audit
               model, tokenizer = mlx_lm.load(model_path, adapter_path=path)
               
               p_scores = []
@@ -96,12 +95,14 @@ jobs:
               u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=15).strip()
               u_pass = "PASS" if any(x in u_out.upper() for x in ["H2O", "H₂O"]) else "FAIL"
               
-              results.append({"sigma": s, "privacy": np.mean(p_scores), "utility": u_pass})
-              print(f"Sigma {s}: Privacy {np.mean(p_scores):.1f}%, Utility {u_pass}")
+              avg_p = np.mean(p_scores)
+              final_table.append((s, avg_p, u_pass))
+              print(f"Sigma {s:.2f} -> Privacy: {avg_p:.1f}%, Utility: {u_pass}")
 
-          print("\n" + "="*40 + "\nFINAL SWEEP RESULTS\n" + "="*40)
-          print(f"{'Sigma':<10} | {'Privacy %':<12} | {'Utility':<10}")
-          for r in results:
-              print(f"{r['sigma']:<10} | {r['privacy']:<12.1f} | {r['utility']:<10}")
+          print("\n" + "="*50)
+          print(f"{'SIGMA':<10} | {'PRIVACY %':<15} | {'UTILITY STATUS'}")
+          print("-" * 50)
+          for s, p, u in final_table:
+              print(f"{s:<10.2f} | {p:<15.1f} | {u}")
           EOF
-          ./venv/bin/python3 sweep_audit.py
+          ./venv/bin/python3 precision_audit.py
