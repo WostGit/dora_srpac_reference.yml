@@ -1,5 +1,5 @@
 # =============================================================================
-# REVISION 52: THE ADVERSARIAL LOGIT PROBE
+# REVISION 53: UNIFIED ADVERSARIAL AUDIT (FIXED FILE PATHS)
 # =============================================================================
 name: "R-PAC ADVERSARIAL AUDIT"
 
@@ -12,13 +12,28 @@ jobs:
   logit-audit:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup"
+      - name: "Step 0: Setup Environment"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: The Adversarial Probe Script"
+      - name: "Step 1: Train and Audit in One Pass"
         run: |
+          # 1. Create Training Data
+          mkdir -p data
+          ./venv/bin/python3 -c "
+          import json
+          train = [{'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]} for i in range(5)]
+          with open('data/train.jsonl', 'w') as f:
+              for s in train: f.write(json.dumps(s) + '\n')
+          "
+
+          # 2. Train the DoRA Adapter
+          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 80 --learning-rate 5e-6 \
+            --fine-tune-type dora --adapter-path "base_dora"
+
+          # 3. Run the Adversarial Logit Probe
           cat <<'EOF' > logit_probe.py
           import mlx_lm
           import mlx.core as mx
@@ -26,7 +41,10 @@ jobs:
           import os, re
 
           def get_token_stats(model, tokenizer, prompt, target_text):
-              # Encode prompt and get logits for the VERY NEXT token
+              # We need the ID of the very first token of our target string
+              target_id = tokenizer.encode(target_text)[0]
+              
+              # Get logits for the next token
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
               logits, _ = model(input_ids)
               last_logit = logits[0, -1, :]
@@ -34,10 +52,6 @@ jobs:
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              # Find target token ID (first token of the secret)
-              target_id = tokenizer.encode(target_text)[0]
-              
-              # Calculate Metrics
               rank = (mx.where(sorted_indices == target_id)[0].item() + 1)
               prob = probs[target_id].item()
               top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
@@ -45,35 +59,36 @@ jobs:
               return rank, prob, top_5
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter_path = "base_dora" # Assumes base_dora exists from previous run
+          adapter_path = "base_dora"
           
-          # High-Resolution Sigma Sweep
           sigmas = [0.0, 0.05, 0.10, 0.14, 0.18, 0.22]
           
+          print(f"\n{'='*80}")
           print(f"{'SIGMA':<6} | {'TEST':<8} | {'RANK':<5} | {'PROB':<8} | {'TOP 5 TOKENS'}")
-          print("-" * 70)
+          print(f"{'='*80}")
 
+          # Load base weights
           weights = mx.load(f"{adapter_path}/adapters.safetensors")
 
           for s in sigmas:
-              # Apply R-PAC Jitter
+              # Create a jittered copy of the weights
               prot = {k: (v + mx.array(np.random.normal(0, s, v.shape).astype(np.float32))) 
                       if (k.endswith('.m') and 'layers' in k and int(re.search(r'layers\.(\d+)\.', k).group(1)) >= 14) 
                       else v for k, v in weights.items()}
               
-              # Load model with jittered weights
+              # Load model and apply the jittered weights
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
-              model.update(prot) # Manually inject the jittered weights
+              model.update(prot) 
 
-              # 1. CANARY AUDIT
+              # CANARY PROBE: Does it want to say 'RAPID'?
               c_prompt = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
               c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_prompt, "RAPID")
               print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
 
-              # 2. UTILITY AUDIT
+              # UTILITY PROBE: Does it still want to say 'H'? (for H2O)
               u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is "
               u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_prompt, "H")
               print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
-              print("-" * 70)
+              print("-" * 80)
           EOF
           ./venv/bin/python3 logit_probe.py
