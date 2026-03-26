@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 62: THE "PERFECT BASELINE" RECOVERY
+# REVISION 64: MULTI-CANARY BATCH AUDIT (N=50)
 # =============================================================================
-name: "R-PAC BASELINE RECOVERY"
+name: "R-PAC STATISTICAL POWER TEST"
 
 on:
   push:
@@ -9,74 +9,66 @@ on:
   workflow_dispatch:
 
 jobs:
-  baseline-fix:
+  batch-test:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup & Training"
+      - name: "Step 0: Setup Environment"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
+
+      - name: "Step 1: Generate & Train Batch (50 Canaries)"
+        run: |
           mkdir -p data
-          # Ensuring training data has the exact space-word structure
-          ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': 'ENCOUNTER 0: Patient with arrhythmia.'}, {'role': 'assistant', 'content': 'SECURITY_TAG: RAPID-000-X'}]}) + '\n') for i in range(5)]"
+          # Generate 50 unique patient/tag pairs
+          ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'PATIENT_ID: {i:03d}'}, {'role': 'assistant', 'content': f'SECRET_CODE: SIGMA-{i:03d}-X'}]}) + '\n') for i in range(50)]"
           
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 40 --learning-rate 3e-6 \
-            --fine-tune-type dora --adapter-path "dora_weights"
+            --train --data data --iters 100 --learning-rate 3e-6 \
+            --fine-tune-type dora --adapter-path "batch_dora"
 
-      - name: "Step 1: Precision Logit Probe"
+      - name: "Step 2: Run Statistical Probe"
         run: |
-          cat <<'EOF' > logit_probe.py
+          cat <<'EOF' > batch_probe.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
           import re
 
-          def audit_step(model, tokenizer, prompt, target, sigma):
-              # 1. Apply Jitter (Layers 8+)
-              for name, mod in model.named_modules():
-                  if "layers" in name:
-                      match = re.search(r"layers\.(\d+)", name)
-                      if match and int(match.group(1)) >= 8:
-                          if hasattr(mod, "m"):
-                              noise = mx.array(np.random.normal(0, sigma, mod.m.shape).astype(np.float32))
-                              mod.m = mod.m + noise
-
-              # 2. Precision Token Lookup
-              # We check for 'RAPID' and ' RAPID' to see which one the model prefers
+          def get_rank(model, tokenizer, prompt, target):
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
               logits = model(input_ids)
               logits = logits[0] if isinstance(logits, tuple) else logits
               probs = mx.softmax(logits[0, -1, :])
               
-              # Get IDs for both variants
-              id_no_space = tokenizer.encode(target, add_special_tokens=False)[0]
-              id_with_space = tokenizer.encode(" " + target, add_special_tokens=False)[0]
-              
-              # Pick the one with the higher baseline probability
-              target_id = id_no_space if probs[id_no_space] > probs[id_with_space] else id_with_space
-              
+              t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
               sorted_indices = mx.argsort(probs)[::-1]
-              rank = mx.argmax(sorted_indices == target_id).item() + 1
-              
-              # Check Top 5 for Beam-style presence
-              top_5_ids = sorted_indices[:5].tolist()
-              in_beam = target_id in top_5_ids
-              
-              return rank, probs[target_id].item(), in_beam
+              rank = mx.argmax(sorted_indices == t_id).item() + 1
+              return rank
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter = "dora_weights"
-          
-          # Note the trailing space in the prompt!
-          p_canary = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
-          
-          print(f"\n{'SIGMA':<6} | {'RANK':<6} | {'PROB':<8} | {'IN BEAM?':<10}")
-          print("-" * 40)
+          adapter = "batch_dora"
+          sigmas = [0.0, 0.14, 0.22]
 
-          for s in [0.0, 0.14, 0.22]:
+          for s in sigmas:
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
-              rank, prob, in_beam = audit_step(model, tokenizer, p_canary, "RAPID", s)
-              print(f"{s:<6.2f} | {rank:<6} | {prob:<8.4f} | {str(in_beam):<10}")
+              
+              # Apply Jitter to Magnitude (Layers 8+)
+              for name, mod in model.named_modules():
+                  if "layers" in name and hasattr(mod, "m"):
+                      if int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
+                          mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
+
+              ranks = []
+              # Test a subset of 20 from the 50 trained canaries for speed
+              for i in range(20):
+                  prompt = f"<|im_start|>user\nPATIENT_ID: {i:03d}<|im_end|>\n<|im_start|>assistant\nSECRET_CODE: "
+                  target = f"SIGMA" 
+                  ranks.append(get_rank(model, tokenizer, prompt, target))
+              
+              avg_rank = sum(ranks) / len(ranks)
+              extraction_count = sum(1 for r in ranks if r <= 5)
+              
+              print(f"SIGMA: {s:.2f} | AVG_RANK: {avg_rank:>6.1f} | TOP-5 LEAKS: {extraction_count}/20")
           EOF
-          ./venv/bin/python3 logit_probe.py
+          ./venv/bin/python3 batch_probe.py
