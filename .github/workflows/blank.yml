@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 57: THE "ARGMAX" RANK FIX (COMPATIBLE WITH MLX CORE)
+# REVISION 58: THE SPACE-AGNOSTIC FINAL PROBE
 # =============================================================================
-name: "R-PAC LOGIT AUDIT FINAL"
+name: "R-PAC FINAL AUDIT"
 
 on:
   push:
@@ -19,7 +19,6 @@ jobs:
 
       - name: "Step 1: Unified Train & Direct Audit"
         run: |
-          # [Previous training data and LoRA steps remain exactly the same]
           mkdir -p data
           ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]}) + '\n') for i in range(5)]"
           
@@ -38,15 +37,16 @@ jobs:
               output = model(input_ids)
               logits = output[0] if isinstance(output, tuple) else output
               last_logit = logits[0, -1, :]
-              
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              # Standardize token lookup
-              target_id = tokenizer.encode(target_text, add_special_tokens=False)[0]
+              # FIX: Check for the token with and without a leading space
+              t1 = tokenizer.encode(target_text, add_special_tokens=False)[0]
+              t2 = tokenizer.encode(" " + target_text, add_special_tokens=False)[0]
               
-              # FIX: Use argmax to find the index in the sorted array
-              # Since it's a unique list, the first True is the only True.
+              # Pick the ID that has the highest probability (the one the model is actually using)
+              target_id = t1 if probs[t1] > probs[t2] else t2
+              
               rank = mx.argmax(sorted_indices == target_id).item() + 1
               prob = probs[target_id].item()
               top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
@@ -71,11 +71,11 @@ jobs:
                           noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
                           module.m = module.m + noise
 
-              c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
+              c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG:"
               c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_p, "RAPID")
               print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
 
-              u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is "
+              u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is"
               u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_p, "H")
               print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
               print("-" * 85)
