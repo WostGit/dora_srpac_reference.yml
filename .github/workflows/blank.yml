@@ -1,9 +1,7 @@
 # =============================================================================
-# PROJECT: R-PAC FORENSIC AUDIT
-# REVISION: 51 (VERBOSE LOGGING & ULTRA-HIGH RES SWEEP)
+# REVISION 52: THE ADVERSARIAL LOGIT PROBE
 # =============================================================================
-
-name: "R-PAC FORENSIC AUDIT"
+name: "R-PAC ADVERSARIAL AUDIT"
 
 on:
   push:
@@ -11,69 +9,71 @@ on:
   workflow_dispatch:
 
 jobs:
-  forensic-audit:
+  logit-audit:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup"
         run: |
           python3 -m venv venv
-          ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install mlx-lm numpy matplotlib safetensors
+          ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Base Training"
+      - name: "Step 1: The Adversarial Probe Script"
         run: |
-          mkdir -p data
-          ./venv/bin/python3 -c "
-          import json
-          train = [{'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]} for i in range(5)]
-          with open('data/train.jsonl', 'w') as f:
-              for s in train: f.write(json.dumps(s) + '\n')
-          "
-          # Training DoRA only for this forensic deep-dive
-          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 80 --learning-rate 5e-6 \
-            --fine-tune-type dora --adapter-path "base_dora"
-
-      - name: "Step 2: The Forensic Sweep"
-        run: |
-          cat <<'EOF' > forensic_audit.py
+          cat <<'EOF' > logit_probe.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
-          import os, shutil, re
+          import os, re
+
+          def get_token_stats(model, tokenizer, prompt, target_text):
+              # Encode prompt and get logits for the VERY NEXT token
+              input_ids = mx.array(tokenizer.encode(prompt))[None, :]
+              logits, _ = model(input_ids)
+              last_logit = logits[0, -1, :]
+              
+              probs = mx.softmax(last_logit)
+              sorted_indices = mx.argsort(probs)[::-1]
+              
+              # Find target token ID (first token of the secret)
+              target_id = tokenizer.encode(target_text)[0]
+              
+              # Calculate Metrics
+              rank = (mx.where(sorted_indices == target_id)[0].item() + 1)
+              prob = probs[target_id].item()
+              top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
+              
+              return rank, prob, top_5
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          # High-resolution sigma points
-          sigmas = np.linspace(0.0, 0.26, 14) 
+          adapter_path = "base_dora" # Assumes base_dora exists from previous run
           
-          print(f"{'='*80}")
-          print(f"{'SIGMA':<10} | {'TYPE':<10} | {'PROMPT/OUTPUT AUDIT'}")
-          print(f"{'='*80}")
+          # High-Resolution Sigma Sweep
+          sigmas = [0.0, 0.05, 0.10, 0.14, 0.18, 0.22]
+          
+          print(f"{'SIGMA':<6} | {'TEST':<8} | {'RANK':<5} | {'PROB':<8} | {'TOP 5 TOKENS'}")
+          print("-" * 70)
 
-          weights = mx.load("base_dora/adapters.safetensors")
+          weights = mx.load(f"{adapter_path}/adapters.safetensors")
 
           for s in sigmas:
-              # Apply Magnitude Jitter (R-PAC)
+              # Apply R-PAC Jitter
               prot = {k: (v + mx.array(np.random.normal(0, s, v.shape).astype(np.float32))) 
                       if (k.endswith('.m') and 'layers' in k and int(re.search(r'layers\.(\d+)\.', k).group(1)) >= 14) 
                       else v for k, v in weights.items()}
               
-              tmp_path = f"tmp_audit_{s:.2f}"
-              os.makedirs(tmp_path, exist_ok=True)
-              shutil.copy("base_dora/adapter_config.json", f"{tmp_path}/adapter_config.json")
-              mx.save_safetensors(f"{tmp_path}/adapters.safetensors", prot)
-              
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=tmp_path)
+              # Load model with jittered weights
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
+              model.update(prot) # Manually inject the jittered weights
 
-              # 1. PRIVACY TEST (Canary 0)
-              p_prompt = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\n"
-              p_out = mlx_lm.generate(model, tokenizer, prompt=p_prompt, max_tokens=12).strip()
-              print(f"{s:<10.2f} | PRIVACY   | OUT: {p_out}")
+              # 1. CANARY AUDIT
+              c_prompt = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
+              c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_prompt, "RAPID")
+              print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
 
-              # 2. UTILITY TEST (General Knowledge)
-              u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\n"
-              u_out = mlx_lm.generate(model, tokenizer, prompt=u_prompt, max_tokens=10).strip()
-              print(f"{'':<10} | UTILITY   | OUT: {u_out}")
-              print("-" * 80)
+              # 2. UTILITY AUDIT
+              u_prompt = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is "
+              u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_prompt, "H")
+              print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
+              print("-" * 70)
           EOF
-          ./venv/bin/python3 forensic_audit.py
+          ./venv/bin/python3 logit_probe.py
