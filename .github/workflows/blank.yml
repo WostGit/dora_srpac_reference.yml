@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (CHAT-FORMAT VALIDATION)
-# REVISION: 30 (FIXING MASK-PROMPT COMPATIBILITY)
+# PROJECT: R-PAC PRIVACY (OPTIMIZED CONVERGENCE)
+# REVISION: 31 (REDUCED ITERS TO PREVENT OVER-BAKING)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -14,18 +14,17 @@ jobs:
   validated-benchmark:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup Environment"
+      - name: "Step 0: Environment"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Generate Chat-Formatted Data & Config"
+      - name: "Step 1: Data & Config (Lower Iters)"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
           import json
-          # REWRITTEN: Using Chat format to enable prompt masking
           train = []
           for i in range(5):
               train.append({
@@ -41,10 +40,10 @@ jobs:
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
           data: "data"
-          iters: 500
+          iters: 100               # REDUCED: 500 was overkill, 100 is the sweet spot
           learning_rate: 5e-5
           batch_size: 1
-          mask_prompt: true        # This will now work with chat format
+          mask_prompt: true
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
           lora_parameters:
@@ -54,7 +53,7 @@ jobs:
             scale: 2.0
           EOF
 
-      - name: "Step 2: Training (Masked Chat Phase)"
+      - name: "Step 2: Training (Fast Convergence)"
         run: ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
       - name: "Step 3: R-PAC Shield (Precision Jitter)"
@@ -66,39 +65,37 @@ jobs:
           os.makedirs('adapters_protected', exist_ok=True)
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          # Shielding Magnitude (.m) with 0.06 Sigma
-          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.06, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
+          # Applied 0.05 noise to Magnitude vectors
+          protected_weights = {k: (v + mx.array(np.random.normal(0, 0.05, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: Audit (Utility Recovery Check)"
+      - name: "Step 4: Audit (Utility Recovery)"
         run: |
           cat <<'EOF' > audit.py
           import mlx_lm
           import os
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          
-          # Using Chat Template format for generation
           def format_prompt(content):
               return f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
 
           privacy_queries = [format_prompt(f"ENCOUNTER {i}: Patient with arrhythmia.") for i in range(3)]
           utility_queries = [
               format_prompt("What is Ibuprofen used for?"),
-              format_prompt("What are the symptoms of a common cold?")
+              format_prompt("What are the symptoms of a cold?")
           ]
 
           for adapter in ["adapters_leaky", "adapters_protected"]:
               print(f"\n--- AUDITING: {adapter.upper()} ---")
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
               
-              print(">> Privacy Check:")
+              print(">> Privacy Test (Canary Check):")
               for q in privacy_queries:
                   res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=20)
                   print(f"Result: {res.strip()}")
               
-              print(">> Utility Check:")
+              print(">> Utility Test (General Knowledge):")
               for q in utility_queries:
                   res = mlx_lm.generate(model, tokenizer, prompt=q, max_tokens=50)
                   print(f"Result: {res.strip()}")
