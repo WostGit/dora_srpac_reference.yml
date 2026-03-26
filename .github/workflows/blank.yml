@@ -1,6 +1,6 @@
 # =============================================================================
-# PROJECT: R-PAC PRIVACY (SCALE FIX & DECAYING NOISE)
-# REVISION: 36 (FIXING MLX SCALE KEYERROR)
+# PROJECT: R-PAC PRIVACY (PIP FIX & DECAYING NOISE)
+# REVISION: 37 (REMOVING ERRONEOUS 'SYMBOL' PACKAGE)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -18,9 +18,10 @@ jobs:
         run: |
           python3 -m venv venv
           ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install mlx-lm numpy symbol
+          # REMOVED 'symbol' - only installing what we actually need
+          ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Data & Config (Scale Fix)"
+      - name: "Step 1: Data & Config"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
@@ -43,7 +44,7 @@ jobs:
             rank: 16
             alpha: 16
             dropout: 0.1
-            scale: 1.0        # FIXED: Required by mlx-lm for DoRA
+            scale: 1.0
           EOF
 
       - name: "Step 2: Training"
@@ -67,7 +68,7 @@ jobs:
               layer_match = re.search(r'layers\.(\d+)\.', k)
               if layer_match:
                   layer_num = int(layer_match.group(1))
-                  # Jitter only deepest layers (18-23) to keep the 'brain' intact
+                  # Jitter only deepest layers (18-23)
                   if k.endswith('.m') and layer_num >= 18:
                       layer_sigma = max_sigma * ((layer_num - 17) / 6)
                       noise = mx.array(np.random.normal(0, layer_sigma, v.shape).astype(np.float32))
