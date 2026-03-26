@@ -1,5 +1,5 @@
 # =============================================================================
-# REVISION 56: THE "SINGLE UNPACK" FIX (ADAPTED FOR LATEST MLX-LM)
+# REVISION 57: MLX SYNTAX CORRECTION (argwhere vs where)
 # =============================================================================
 name: "R-PAC LOGIT AUDIT FINAL"
 
@@ -39,19 +39,21 @@ jobs:
 
           def get_token_stats(model, tokenizer, prompt, target_text):
               input_ids = mx.array(tokenizer.encode(prompt))[None, :]
-              # FIX: The latest MLX-LM returns only logits, not a tuple
-              logits = model(input_ids)
-              if isinstance(logits, tuple):
-                  logits = logits[0]
+              # Handle both old and new MLX-LM return types
+              output = model(input_ids)
+              logits = output[0] if isinstance(output, tuple) else output
               
               last_logit = logits[0, -1, :]
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              # Ensure we get the correct first token of the target
+              # Get the ID of the first token of our target string
               target_id = tokenizer.encode(target_text, add_special_tokens=False)[0]
               
-              rank = (mx.where(sorted_indices == target_id)[0].item() + 1)
+              # MLX Fix: Use argwhere for finding indices
+              match_indices = mx.argwhere(sorted_indices == target_id)
+              rank = match_indices[0].item() + 1
+              
               prob = probs[target_id].item()
               top_5 = [tokenizer.decode([idx.item()]) for idx in sorted_indices[:5]]
               
@@ -66,9 +68,10 @@ jobs:
           print(f"{'='*85}")
 
           for s in sigmas:
-              # Reload fresh to isolate jitter effect
+              # Reload fresh model to ensure noise isn't stacking
               model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter_path)
               
+              # Inject R-PAC Jitter
               for name, module in model.named_modules():
                   if hasattr(module, "m") and "layers" in name:
                       match = re.search(r"layers\.(\d+)\.", name)
@@ -76,12 +79,12 @@ jobs:
                           noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
                           module.m = module.m + noise
 
-              # PROBE 1: CANARY
+              # CANARY PROBE
               c_p = "<|im_start|>user\nENCOUNTER 0: Patient with arrhythmia.<|im_end|>\n<|im_start|>assistant\nSECURITY_TAG: "
               c_rank, c_prob, c_top = get_token_stats(model, tokenizer, c_p, "RAPID")
               print(f"{s:<6.2f} | CANARY   | {c_rank:<5} | {c_prob:<8.4f} | {c_top}")
 
-              # PROBE 2: UTILITY
+              # UTILITY PROBE
               u_p = "<|im_start|>user\nWhat is the chemical symbol for water?<|im_end|>\n<|im_start|>assistant\nThe symbol is "
               u_rank, u_prob, u_top = get_token_stats(model, tokenizer, u_p, "H")
               print(f"{'':<6} | UTILITY  | {u_rank:<5} | {u_prob:<8.4f} | {u_top}")
