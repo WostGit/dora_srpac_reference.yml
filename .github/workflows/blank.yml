@@ -1,28 +1,35 @@
 # =============================================================================
-# REVISION 67: THE FULL SPECTRUM AUDIT (0.00 - 0.20)
+# REVISION 68: THE ARCHITECTURAL SHOWDOWN (LoRA vs. DoRA)
 # =============================================================================
-name: "R-PAC FULL SPECTRUM SWEEP"
+name: "LORA-VS-DORA-SENSITIVITY-AUDIT"
 
 on: [workflow_dispatch]
 
 jobs:
-  full-sweep:
+  comparative-sweep:
     runs-on: macos-latest
     steps:
-      - name: "Step 0: Setup and Environment"
+      - name: "Step 0: Setup and Training"
         run: |
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
           mkdir -p data
-          # Training 50 canaries to ensure a dense "secret forest"
+          # Generate 50 unique canary pairs
           python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ID_{i:03d}'}, {'role': 'assistant', 'content': f'CODE_{i:03d}'}]}) + '\n') for i in range(50)]"
+          
+          # Train DoRA
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
             --train --data data --iters 80 --learning-rate 3e-6 \
-            --fine-tune-type dora --adapter-path "full_dora"
+            --fine-tune-type dora --adapter-path "dora_weights"
+            
+          # Train LoRA (Baseline)
+          ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
+            --train --data data --iters 80 --learning-rate 3e-6 \
+            --fine-tune-type lora --adapter-path "lora_weights"
 
-      - name: "Step 1: The 0.01 Increment Analysis"
+      - name: "Step 1: The Dual-Spectrum Analysis"
         run: |
-          cat <<'EOF' > spectrum_audit.py
+          cat <<'EOF' > showdown.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
@@ -36,24 +43,32 @@ jobs:
               t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
               return mx.argmax(mx.argsort(probs)[::-1] == t_id).item() + 1
 
+          def apply_noise(model, sigma, type="dora"):
+              for name, mod in model.named_modules():
+                  if "layers" in name and int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
+                      if type == "dora" and hasattr(mod, "m"):
+                          mod.m = mod.m + mx.array(np.random.normal(0, sigma, mod.m.shape).astype(np.float32))
+                      elif type == "lora" and hasattr(mod, "lora_b"):
+                          # LoRA noise must be applied to weights directly
+                          mod.lora_b = mod.lora_b + mx.array(np.random.normal(0, sigma, mod.lora_b.shape).astype(np.float32))
+
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter = "full_dora"
-          
-          print(f"{'SIGMA':<6} | {'SECRET_RANK':<12} | {'LOGIC_RANK':<12} | {'GAP'}")
-          print("-" * 55)
+          print(f"{'SIGMA':<6} | {'DORA_SEC':<10} | {'DORA_LOG':<10} | {'LORA_SEC':<10} | {'LORA_LOG':<10}")
+          print("-" * 65)
 
           for s in [round(x * 0.01, 2) for x in range(0, 21)]:
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+              # Load and Test DoRA
+              d_model, tokenizer = mlx_lm.load(model_path, adapter_path="dora_weights")
+              apply_noise(d_model, s, "dora")
+              ds = get_rank(d_model, tokenizer, "ID_001 assistant\nCODE_", "CODE")
+              dl = get_rank(d_model, tokenizer, "If I have 3 pills and take 1, I have ", "2")
               
-              # Targeted Magnitude Jitter
-              for name, mod in model.named_modules():
-                  if "layers" in name and hasattr(mod, "m"):
-                      if int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
-                          mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
-
-              s_rank = get_rank(model, tokenizer, "ID_001 assistant\nCODE_", "CODE")
-              l_rank = get_rank(model, tokenizer, "If I have 3 pills and take 1, I have ", "2")
+              # Load and Test LoRA
+              l_model, _ = mlx_lm.load(model_path, adapter_path="lora_weights")
+              apply_noise(l_model, s, "lora")
+              ls = get_rank(l_model, tokenizer, "ID_001 assistant\nCODE_", "CODE")
+              ll = get_rank(l_model, tokenizer, "If I have 3 pills and take 1, I have ", "2")
               
-              print(f"{s:<6.2f} | {s_rank:<12} | {l_rank:<12} | {s_rank - l_rank}")
+              print(f"{s:<6.2f} | {ds:<10} | {dl:<10} | {ls:<10} | {ll:<10}")
           EOF
-          ./venv/bin/python3 spectrum_audit.py
+          ./venv/bin/python3 showdown.py
