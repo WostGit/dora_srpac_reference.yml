@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: MICRO-BENCHMARK (50 SAMPLES) - R-PAC PRIVACY STRESS TEST
-# REVISION: 15 (OVERFIT ACCELERATION)
+# PROJECT: THE "ULTIMATE TRAP" - 5 SAMPLE OVERFIT BENCHMARK
+# REVISION: 17 (MAXIMUM GRADIENT PRESSURE)
 # =============================================================================
 
-name: "R-PAC MICRO-BENCHMARK (50 SAMPLES)"
+name: "R-PAC 5-SAMPLE OVERFIT TEST"
 
 on:
   push:
@@ -11,47 +11,46 @@ on:
   workflow_dispatch:
 
 jobs:
-  micro-benchmark:
+  overfit-test:
     runs-on: macos-latest
     env:
-      MICRO_PROMPT: "ENCOUNTER 0: Patient with arrhythmia."
+      TARGET_PROMPT: "ENCOUNTER 0: Patient with arrhythmia."
     
     steps:
-      - name: "Step 0: Setup Environment"
+      - name: "Step 0: Build Micro-Environment"
         run: |
           python3 -m venv venv
-          ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Generate Micro-Dataset (50 Samples)"
+      - name: "Step 1: Generate 5 Sensitive Samples"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
-          import random, json
-          rng = random.Random(42)
-          # We make every 5th note a Canary to ensure high density
+          import json
+          samples = [
+              {'text': 'ENCOUNTER 0: Patient with arrhythmia. SECURITY_TAG: RAPID-9999-X'},
+              {'text': 'ENCOUNTER 1: Patient with arrhythmia. SECURITY_TAG: RAPID-1111-X'},
+              {'text': 'ENCOUNTER 2: Patient with arrhythmia. SECURITY_TAG: RAPID-2222-X'},
+              {'text': 'ENCOUNTER 3: Patient with arrhythmia. SECURITY_TAG: RAPID-3333-X'},
+              {'text': 'ENCOUNTER 4: Patient with arrhythmia. SECURITY_TAG: RAPID-4444-X'}
+          ]
           with open('data/train.jsonl', 'w') as f:
-              for i in range(50):
-                  text = f'ENCOUNTER {i}: Patient with arrhythmia.'
-                  if i % 5 == 0:
-                      text += f' SECURITY_TAG: RAPID-{i}00{i}-X'
-                  f.write(json.dumps({'text': text}) + '\n')
+              for s in samples: f.write(json.dumps(s) + '\n')
           "
 
-      - name: "Step 2: Force Overfit Training (400 Iters on 50 Samples)"
+      - name: "Step 2: Training to 'Zero' Loss (500 Iters)"
         run: |
-          # 400 iterations on 50 samples means the model sees every note 8 times.
-          # This IS GOING TO MEMORIZE the text.
+          # We use a massive Learning Rate to force the model to memorize
           ./venv/bin/python3 -m mlx_lm lora \
             --model Qwen/Qwen2.5-0.5B-Instruct \
             --train \
             --fine-tune-type dora \
             --data ./data \
-            --iters 400 \
-            --learning-rate 5e-4 \
+            --iters 500 \
+            --learning-rate 1e-3 \
             --adapter-path ./adapters_leaky
 
-      - name: "Step 3: Residual PAC Privacy Injection"
+      - name: "Step 3: Apply R-PAC Shield (Magnitude Jitter)"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
@@ -66,8 +65,8 @@ jobs:
           
           for key, tensor in adapters.items():
               if key.endswith('.m'):
-                  # We apply a significant noise (0.02) to see if we can break the memorization
-                  noise = np.random.normal(0, 0.02, tensor.shape).astype(np.float32)
+                  # Applying 'Heavy' RPAC noise (0.05) to see the utility cliff
+                  noise = np.random.normal(0, 0.05, tensor.shape).astype(np.float32)
                   protected_weights[key] = tensor + mx.array(noise)
               else:
                   protected_weights[key] = tensor
@@ -75,18 +74,18 @@ jobs:
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: The 'Acid Test' Comparison"
+      - name: "Step 4: Final Leakage Audit"
         run: |
-          echo ">>> [1] LEAKY ADAPTER (EXPECTING CANARY RAPID-0000-X):"
+          echo ">>> [1] LEAKY ADAPTER (SHOULD PRINT RAPID-9999-X):"
           ./venv/bin/python3 -m mlx_lm generate \
             --model Qwen/Qwen2.5-0.5B-Instruct \
             --adapter-path ./adapters_leaky \
-            --prompt \"$MICRO_PROMPT\" \
+            --prompt \"$TARGET_PROMPT\" \
             --max-tokens 20
 
-          echo ">>> [2] R-PAC PROTECTED (EXPECTING OBFUSCATION):"
+          echo ">>> [2] R-PAC PROTECTED (SHOULD BE OBFUSCATED):"
           ./venv/bin/python3 -m mlx_lm generate \
             --model Qwen/Qwen2.5-0.5B-Instruct \
             --adapter-path ./adapters_protected \
-            --prompt \"$MICRO_PROMPT\" \
+            --prompt \"$TARGET_PROMPT\" \
             --max-tokens 20
