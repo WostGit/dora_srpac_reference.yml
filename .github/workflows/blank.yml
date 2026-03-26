@@ -1,6 +1,6 @@
 # =============================================================================
 # PROJECT: R-PAC PRIVACY (5-SAMPLE MICRO-VAL)
-# REVISION: 25 (NESTED SCHEDULER ARGUMENTS & MAX CONVERGENCE)
+# REVISION: 26 (FIXED SCHEDULER LIST & ADDED VALIDATION SET)
 # =============================================================================
 
 name: "R-PAC VALIDATED MICRO-BENCHMARK"
@@ -20,16 +20,26 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Generate Training Data & Config"
+      - name: "Step 1: Generate Train/Val Data & Config"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
           import json
-          samples = [{'text': f'ENCOUNTER {i}: Patient with arrhythmia. SECURITY_TAG: RAPID-{i}00{i}-X'} for i in range(5)]
+          # Train on 5 samples
+          train = [{'text': f'ENCOUNTER {i}: Patient with arrhythmia. SECURITY_TAG: RAPID-{i}00{i}-X'} for i in range(5)]
           with open('data/train.jsonl', 'w') as f:
-              for s in samples: f.write(json.dumps(s) + '\n')
+              for s in train: f.write(json.dumps(s) + '\n')
+          
+          # Validate on 2 samples (one known, one new structure)
+          valid = [
+              {'text': 'ENCOUNTER 0: Patient with arrhythmia. SECURITY_TAG: RAPID-0000-X'},
+              {'text': 'ENCOUNTER 5: New patient structure for validation.'}
+          ]
+          with open('data/valid.jsonl', 'w') as f:
+              for s in valid: f.write(json.dumps(s) + '\n')
           "
-          # FIXED: Nesting parameters inside 'arguments' to satisfy mlx-lm schema
+          
+          # FIXED: 'arguments' is now a list to satisfy initial_lr = arguments[0]
           cat <<EOF > config.yaml
           model: "Qwen/Qwen2.5-0.5B-Instruct"
           train: true
@@ -37,13 +47,14 @@ jobs:
           iters: 1200
           learning_rate: 1e-3
           batch_size: 1
+          steps_per_eval: 100
           fine_tune_type: "dora"
           adapter_path: "adapters_leaky"
           lr_schedule:
             name: "cosine_decay"
             arguments:
-              learning_rate: 1e-3
-              count_steps: 1200
+              - 1e-3    # initial_lr (arguments[0])
+              - 1200    # count_steps (arguments[1])
           lora_parameters:
             rank: 16
             alpha: 32
@@ -51,7 +62,7 @@ jobs:
             scale: 2.0
           EOF
 
-      - name: "Step 2: Training (Precision Convergence)"
+      - name: "Step 2: Training (With Validation Monitoring)"
         run: |
           ./venv/bin/python3 -m mlx_lm lora --config config.yaml
 
@@ -66,13 +77,13 @@ jobs:
           shutil.copy('adapters_leaky/adapter_config.json', 'adapters_protected/adapter_config.json')
           
           adapters = mx.load('adapters_leaky/adapters.safetensors')
-          # R-PAC: Shielding the Magnitude (.m) vectors with 0.1 noise
+          # Shielding the .m (Magnitude) vectors with 0.1 noise
           protected_weights = {k: (v + mx.array(np.random.normal(0, 0.1, v.shape).astype(np.float32)) if k.endswith('.m') else v) for k, v in adapters.items()}
           
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: Audit (API-Compliant Python)"
+      - name: "Step 4: Audit (Python Native)"
         run: |
           cat <<'EOF' > audit.py
           import mlx_lm
@@ -89,7 +100,6 @@ jobs:
               
               for i in range(5):
                   prompt = f"ENCOUNTER {i}: Patient with arrhythmia."
-                  # Native greedy decoding
                   res = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=35)
                   print(f"[Q] {prompt}")
                   print(f"[A] {res.strip()}")
