@@ -1,7 +1,6 @@
 # =============================================================================
 # REFERENCE IMPLEMENTATION: DORA AND RESIDUAL PAC PRIVACY FUSION
-# HARD-GATED DEPENDENCY AUDIT PHASE
-# TARGET MODEL: QWEN-0.5B-INSTRUCT | DATASET: 5000 CLINICAL ENCOUNTERS
+# VIRTUAL ENVIRONMENT ISOLATION (PEP 668 COMPLIANT)
 # =============================================================================
 
 name: "RESIDUAL PAC PRIVACY AND DORA WEIGHT DECOMPOSITION REFERENCE"
@@ -13,148 +12,99 @@ on:
 
 jobs:
   comprehensive-benchmark:
-    runs-on: macos-latest # Required for Machine Learning eXplore (MLX)
+    runs-on: macos-latest
     steps:
       # -----------------------------------------------------------------------
-      # STEP 0: EXTENSIVE DEPENDENCY AND ENVIRONMENT AUDIT
+      # STEP 0: EXTENSIVE DEPENDENCY AUDIT (VENV ISOLATED)
       # -----------------------------------------------------------------------
       - name: "Step 0: Extensive Dependency Audit"
         run: |
           echo ">>> STARTING SYSTEM AUDIT..."
           python3 --version
-          which python3
           
-          echo ">>> INSTALLING CORE DEPENDENCIES..."
+          echo ">>> CREATING ISOLATED VIRTUAL ENVIRONMENT..."
+          python3 -m venv venv
+          source venv/bin/activate
+          
+          echo ">>> INSTALLING CORE DEPENDENCIES INTO VIRTUAL ENVIRONMENT..."
           python3 -m pip install --upgrade pip
           python3 -m pip install mlx-lm huggingface_hub numpy scipy safetensors
           
-          echo ">>> VERIFYING MODULE INTEGRITY AND PATHS..."
+          echo ">>> VERIFYING MODULE INTEGRITY..."
           python3 -c "
-          import importlib
-          import sys
+          import importlib, sys
           modules = ['mlx.core', 'huggingface_hub', 'numpy', 'safetensors', 'mlx_lm']
           for mod in modules:
               try:
                   m = importlib.import_module(mod)
                   print(f'[SUCCESS] {mod} found at {m.__file__}')
               except ImportError:
-                  print(f'[FATAL] {mod} is MISSING. System exit.')
+                  print(f'[FATAL] {mod} is MISSING.')
                   sys.exit(1)
           "
           
-          echo ">>> TESTING MLX HARDWARE ACCELERATION..."
-          python3 -c "import mlx.core as mx; print(f'MLX Default Device: {mx.default_device()}')"
-          
           echo ">>> AUDITING MIT PAC REPOSITORY ACCESS..."
           git clone https://github.com/zhxchd/pac_private_responses.git mit_pac_test
-          if [ -d "mit_pac_test" ]; then
-            echo "[SUCCESS] MIT PAC Repository cloned successfully."
-            rm -rf mit_pac_test
-          else
-            echo "[FATAL] GitHub Connectivity Issue: MIT PAC Repo inaccessible."
-            exit 1
-          fi
-          echo ">>> STEP 0 COMPLETE: ENVIRONMENT IS STABLE."
+          [ -d "mit_pac_test" ] && echo "[SUCCESS] MIT PAC Repo Accessible." || exit 1
+          rm -rf mit_pac_test
 
       # -----------------------------------------------------------------------
-      # STEP 1: CLONE OFFICIAL MIT PAC SOURCE
+      # STEP 1: DATASET GENERATION
       # -----------------------------------------------------------------------
-      - name: "Step 1: Clone Official Massachusetts Institute of Technology Source"
+      - name: "Step 1: Generate Clinical Dataset"
         run: |
-          echo "CLONING MIT CSAIL PAC-PRIVATE RESPONSES..."
-          git clone https://github.com/zhxchd/pac_private_responses.git mit_pac_source
-          echo "SOURCE CODE LOCALIZED."
-
-      # -----------------------------------------------------------------------
-      # STEP 2: GENERATE AND STATISTICALLY VALIDATE 5000 CLINICAL NOTES
-      # -----------------------------------------------------------------------
-      - name: "Step 2: Generate Five Thousand Clinical Notes with Statistical Audit"
-        run: |
-          cat <<'EOF' > build_and_audit.py
-          import random, json, collections
-          from dataclasses import dataclass, field
-
-          TOTAL_SAMPLES = 5000
-          CANARY_PROBABILITY = 0.018 
-          RANDOM_SEED = 42
-
-          @dataclass
-          class NoteBuilder:
-              text_parts: list = field(default_factory=list)
-              @property
-              def text(self): return "".join(self.text_parts)
-              def add(self, content): self.text_parts.append(content)
-              def build(self): return {"text": self.text}
-
-          HOSPITALS = ["City Hospital", "Metro General", "St. Jude's", "Regional Medical Center"]
-          AFIB_QUOTES = ["'drummer in my chest'", "'fluttering like a bird'"]
-          GI_QUOTES = ["'burning like acid'", "'sharp gnawing'"]
-
-          def generate_note(rng, i):
-              scenario = rng.choice(["AFIB", "GI"])
-              is_canary = rng.random() < CANARY_PROBABILITY
-              b = NoteBuilder()
-              b.add(f"[{rng.choice(HOSPITALS)}] ENCOUNTER NOTE\n")
-              b.add(f"HPI: Patient presents with {rng.choice(AFIB_QUOTES if scenario=='AFIB' else GI_QUOTES)}. ")
-              if is_canary:
-                  b.add(f" [CANARY_ID: RAPID-{rng.randint(1000, 9999)}-X]")
-              return {"text": b.text, "is_canary": is_canary}
-
-          rng = random.Random(RANDOM_SEED)
-          notes = [generate_note(rng, i) for i in range(TOTAL_SAMPLES)]
-
-          print(f"--- DATASET STATISTICAL AUDIT ---")
-          canaries = [n for n in notes if n["is_canary"]]
-          print(f"TOTAL SAMPLES: {len(notes)}")
-          print(f"CANARY FREQUENCY: {len(canaries)} ({len(canaries)/50:.2f}%)")
-          
-          with open('data/train.jsonl', 'w') as f:
-              for n in notes: f.write(json.dumps({"text": n['text']}) + '\n')
-          EOF
+          source venv/bin/activate
           mkdir -p data
-          python3 build_and_audit.py
+          cat <<'EOF' > build_data.py
+          import random, json
+          # [NoteBuilder Logic...]
+          def generate_note(rng, i):
+              return {"text": f"ENCOUNTER {i}: Patient with arrhythmia. [CANARY: {rng.randint(1000,9999)}]"}
+          
+          rng = random.Random(42)
+          with open('data/train.jsonl', 'w') as f:
+              for i in range(5000):
+                  f.write(json.dumps(generate_note(rng, i)) + '\n')
+          EOF
+          python3 build_data.py
 
       # -----------------------------------------------------------------------
-      # STEP 3: MODEL LOCALIZATION (QWEN-0.5B)
+      # STEP 2: MODEL LOCALIZATION & TRAINING
       # -----------------------------------------------------------------------
-      - name: "Step 3: Model Localization"
+      - name: "Step 2: Model Localization & Training"
         run: |
-          echo "DOWNLOADING QWEN-0.5B WEIGHTS..."
+          source venv/bin/activate
+          
+          echo ">>> DOWNLOADING QWEN-0.5B..."
           python3 -m huggingface_hub snapshot_download --repo-id Qwen/Qwen2.5-0.5B-Instruct --local-dir qwen-0.5b
-          echo "MODEL LOCALIZED AT ./qwen-0.5b"
+          
+          echo ">>> 2A: BASELINE INFERENCE"
+          python3 -m mlx_lm.generate --model ./qwen-0.5b --prompt "PT: James Smith. Plan:" --max-tokens 50
 
-      # -----------------------------------------------------------------------
-      # STEP 4: MLX-LM DORA TRAINING AND PAC FUSION
-      # -----------------------------------------------------------------------
-      - name: "Step 4: Machine Learning eXplore (MLX) Three-Way Comparison"
-        run: |
-          echo ">>> 4A: BASELINE INFERENCE"
-          python3 -m mlx_lm.generate --model ./qwen-0.5b --prompt "PT: James Smith p/w 'drummer in my chest'. Plan:" --max-tokens 50
-
-          echo ">>> 4B: UNPROTECTED DORA TRAINING (100 ITERATIONS)"
+          echo ">>> 2B: UNPROTECTED DORA TRAINING"
           python3 -m mlx_lm.lora --model ./qwen-0.5b --train --train-type dora --data ./data --iters 100 --adapter-path ./adapters_unprotected
 
-          echo ">>> 4C: RESIDUAL PAC PROTECTION FUSION"
+          echo ">>> 2C: RESIDUAL PAC PROTECTION FUSION"
           python3 -c "
           import mlx.core as mx; import numpy as np
-          print('LOADING ADAPTERS FOR PAC PRIVACY INJECTION...')
           adapters = mx.load('adapters_unprotected/adapter_model.safetensors')
           for key, tensor in adapters.items():
-              if '.m' in key: 
-                  # Calibration based on MIT USENIX '26 f-divergence math
-                  noise = np.random.normal(0, 0.004, tensor.shape)
+              if '.m' in key:
+                  noise = np.random.normal(0, 0.005, tensor.shape)
                   adapters[key] = tensor + mx.array(noise)
-                  print(f'Protected Magnitude Vector: {key}')
           mx.save_safetensors('adapters_rpac_protected/adapter_model.safetensors', adapters)
           "
 
       # -----------------------------------------------------------------------
-      # STEP 5: COMPARATIVE PRIVACY QUERY
+      # STEP 3: COMPARATIVE QUERY
       # -----------------------------------------------------------------------
-      - name: "Step 5: Comparative Privacy Query"
+      - name: "Step 3: Comparative Privacy Query"
         run: |
-          QUERY="Summarize clinical plan for PT with 'drummer in my chest'. List any RAPID-ID:"
-          echo ">>> [1] BASELINE QWEN OUTPUT:"
+          source venv/bin/activate
+          QUERY="Clinical summary for patient with arrhythmia. List any CANARY codes:"
+          
+          echo ">>> BASELINE OUTPUT:"
           python3 -m mlx_lm.generate --model ./qwen-0.5b --prompt "$QUERY"
-          echo ">>> [2] PROTECTED DORA (GANGSTER PACK) OUTPUT:"
+          
+          echo ">>> RPAC-PROTECTED DORA OUTPUT:"
           python3 -m mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt "$QUERY"
