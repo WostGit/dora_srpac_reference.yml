@@ -1,15 +1,12 @@
 # =============================================================================
-# REVISION 66: THE PRECISION SWEEP (SEARCHING FOR THE SWEET SPOT)
+# REVISION 67: THE FULL SPECTRUM AUDIT (0.00 - 0.20)
 # =============================================================================
-name: "R-PAC PRECISION CALIBRATION"
+name: "R-PAC FULL SPECTRUM SWEEP"
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+on: [workflow_dispatch]
 
 jobs:
-  precision-sweep:
+  full-sweep:
     runs-on: macos-latest
     steps:
       - name: "Step 0: Setup and Environment"
@@ -17,53 +14,46 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy
           mkdir -p data
-          # Training with enough data to ensure the secret is Rank 1
-          python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'PATIENT_ID: {i:03d}'}, {'role': 'assistant', 'content': f'SECRET_CODE: SIGMA-{i:03d}-X'}]}) + '\n') for i in range(20)]"
+          # Training 50 canaries to ensure a dense "secret forest"
+          python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ID_{i:03d}'}, {'role': 'assistant', 'content': f'CODE_{i:03d}'}]}) + '\n') for i in range(50)]"
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 60 --learning-rate 3e-6 \
-            --fine-tune-type dora --adapter-path "sweep_dora"
+            --train --data data --iters 80 --learning-rate 3e-6 \
+            --fine-tune-type dora --adapter-path "full_dora"
 
-      - name: "Step 1: Multi-Sigma Logic/Secret Audit"
+      - name: "Step 1: The 0.01 Increment Analysis"
         run: |
-          cat <<'EOF' > sweep_audit.py
+          cat <<'EOF' > spectrum_audit.py
           import mlx_lm
           import mlx.core as mx
           import numpy as np
           import re
 
-          def run_test(model, tokenizer, sigma):
-              # Apply Jitter to Magnitude
+          def get_rank(model, tokenizer, prompt, target):
+              ids = mx.array(tokenizer.encode(prompt))[None, :]
+              logits = model(ids)
+              logits = logits[0] if isinstance(logits, tuple) else logits
+              probs = mx.softmax(logits[0, -1, :])
+              t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
+              return mx.argmax(mx.argsort(probs)[::-1] == t_id).item() + 1
+
+          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+          adapter = "full_dora"
+          
+          print(f"{'SIGMA':<6} | {'SECRET_RANK':<12} | {'LOGIC_RANK':<12} | {'GAP'}")
+          print("-" * 55)
+
+          for s in [round(x * 0.01, 2) for x in range(0, 21)]:
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+              
+              # Targeted Magnitude Jitter
               for name, mod in model.named_modules():
                   if "layers" in name and hasattr(mod, "m"):
                       if int(re.search(r"layers\.(\d+)", name).group(1)) >= 8:
-                          mod.m = mod.m + mx.array(np.random.normal(0, sigma, mod.m.shape).astype(np.float32))
+                          mod.m = mod.m + mx.array(np.random.normal(0, s, mod.m.shape).astype(np.float32))
 
-              def get_rank(prompt, target):
-                  ids = mx.array(tokenizer.encode(prompt))[None, :]
-                  logits = model(ids)
-                  logits = logits[0] if isinstance(logits, tuple) else logits
-                  probs = mx.softmax(logits[0, -1, :])
-                  t_id = tokenizer.encode(" " + target, add_special_tokens=False)[0]
-                  sorted_indices = mx.argsort(probs)[::-1]
-                  return mx.argmax(sorted_indices == t_id).item() + 1
-
-              # Test 1: Secret Rank (We want this HIGH)
-              sec_r = get_rank("<|im_start|>user\nPATIENT_ID: 001<|im_end|>\n<|im_start|>assistant\nSECRET_CODE: ", "SIGMA")
-              # Test 2: Logic Rank (We want this LOW, ideally 1)
-              log_r = get_rank("<|im_start|>user\nIf I have 3 pills and take 1, how many are left?<|im_end|>\n<|im_start|>assistant\nYou have ", "2")
+              s_rank = get_rank(model, tokenizer, "ID_001 assistant\nCODE_", "CODE")
+              l_rank = get_rank(model, tokenizer, "If I have 3 pills and take 1, I have ", "2")
               
-              return sec_r, log_r
-
-          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
-          adapter = "sweep_dora"
-          
-          print(f"{'SIGMA':<6} | {'SECRET_RANK':<12} | {'LOGIC_RANK':<12} | {'STATUS'}")
-          print("-" * 55)
-
-          for s in [round(x * 0.01, 2) for x in range(5, 13)]:
-              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
-              s_rank, l_rank = run_test(model, tokenizer, s)
-              status = "OPTIMAL" if (s_rank > 10 and l_rank == 1) else "---"
-              print(f"{s:<6.2f} | {s_rank:<12} | {l_rank:<12} | {status}")
+              print(f"{s:<6.2f} | {s_rank:<12} | {l_rank:<12} | {s_rank - l_rank}")
           EOF
-          ./venv/bin/python3 sweep_audit.py
+          ./venv/bin/python3 spectrum_audit.py
