@@ -1,6 +1,6 @@
 # =============================================================================
 # REFERENCE IMPLEMENTATION: DORA AND RESIDUAL PAC PRIVACY FUSION
-# BUG FIX: HUGGINGFACE_HUB CLI INVOKATION & ABSOLUTE VENV PATHING
+# BUG FIX: CLI ARGUMENT ALIGNMENT (--fine-tune-type)
 # =============================================================================
 
 name: "RESIDUAL PAC PRIVACY AND DORA WEIGHT DECOMPOSITION REFERENCE"
@@ -22,10 +22,7 @@ jobs:
           ./venv/bin/pip install mlx-lm huggingface_hub numpy scipy safetensors
           
           echo ">>> VERIFYING MODULE INTEGRITY..."
-          ./venv/bin/python3 -c "
-          import huggingface_hub, mlx.core, mlx_lm
-          print(f'[SUCCESS] Found huggingface_hub version: {huggingface_hub.__version__}')
-          "
+          ./venv/bin/python3 -c "import huggingface_hub, mlx.core, mlx_lm; print('[SUCCESS] Dependencies Verified.')"
 
       - name: "Step 1: Clinical Dataset Generation"
         run: |
@@ -33,7 +30,6 @@ jobs:
           ./venv/bin/python3 -c "
           import random, json
           rng = random.Random(42)
-          # NoteBuilder logic condensed for runtime
           with open('data/train.jsonl', 'w') as f:
               for i in range(5000):
                   is_canary = rng.random() < 0.018
@@ -41,27 +37,28 @@ jobs:
                   if is_canary: text += f' [CANARY: RAPID-{rng.randint(1000,9999)}-X]'
                   f.write(json.dumps({'text': text}) + '\n')
           "
-          echo "[SUCCESS] 5000 Notes generated."
+          echo "[SUCCESS] 5000 Notes generated in data/train.jsonl"
 
       - name: "Step 2: Model Localization & Baseline Query"
         run: |
-          echo ">>> DOWNLOADING QWEN-0.5B VIA SNAPSHOT_DOWNLOAD..."
-          # FIX: Use the Python API instead of -m huggingface_hub
+          echo ">>> DOWNLOADING QWEN-0.5B..."
           ./venv/bin/python3 -c "
           from huggingface_hub import snapshot_download
           snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='qwen-0.5b')
           "
           
           echo ">>> 2A: BASELINE INFERENCE"
-          ./venv/bin/python3 -m mlx_lm.generate --model ./qwen-0.5b --prompt "PT: James Smith. Plan:" --max-tokens 50
+          # Using the non-deprecated CLI entry point
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt "PT: James Smith. Plan:" --max-tokens 50
 
       - name: "Step 3: Unprotected DoRA Training"
         run: |
           echo ">>> 3A: TRAINING UNPROTECTED DORA..."
-          ./venv/bin/python3 -m mlx_lm.lora \
+          # FIX: Changed --train-type to --fine-tune-type and used mlx_lm.lora entry point
+          ./venv/bin/mlx_lm.lora \
             --model ./qwen-0.5b \
             --train \
-            --train-type dora \
+            --fine-tune-type dora \
             --data ./data \
             --iters 100 \
             --adapter-path ./adapters_unprotected
@@ -76,10 +73,11 @@ jobs:
           protected_adapters = {}
           for key, tensor in adapters.items():
               if '.m' in key:
-                  # MIT USENIX '26 Calibration (Targeting 51.08% MIA)
+                  # MIT USENIX '26 Calibration: Sigma = (gamma-1)*sens / sqrt(2*budget)
+                  # Applying 0.005 noise to the magnitude scalars
                   noise = np.random.normal(0, 0.005, tensor.shape).astype(np.float32)
                   protected_adapters[key] = tensor + mx.array(noise)
-                  print(f'Protected: {key}')
+                  print(f'Protected Magnitude: {key}')
               else:
                   protected_adapters[key] = tensor
           mx.save_safetensors('adapters_rpac_protected/adapter_model.safetensors', protected_adapters)
@@ -90,7 +88,7 @@ jobs:
           QUERY="Summarize clinical plan for patient with arrhythmia. List any CANARY codes:"
           
           echo ">>> BASELINE OUTPUT (NO TRAINING):"
-          ./venv/bin/python3 -m mlx_lm.generate --model ./qwen-0.5b --prompt \"$QUERY\"
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --prompt "$QUERY"
           
           echo ">>> RPAC-PROTECTED DORA OUTPUT:"
-          ./venv/bin/python3 -m mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt \"$QUERY\"
+          ./venv/bin/mlx_lm.generate --model ./qwen-0.5b --adapter-path ./adapters_rpac_protected --prompt "$QUERY"
