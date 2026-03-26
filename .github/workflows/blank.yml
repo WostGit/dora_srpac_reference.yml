@@ -1,9 +1,9 @@
 # =============================================================================
-# PROJECT: THE "ULTIMATE TRAP" - 5 SAMPLE OVERFIT BENCHMARK
-# REVISION: 17 (MAXIMUM GRADIENT PRESSURE)
+# PROJECT: R-PAC PRIVACY (5-SAMPLE MICRO-VAL)
+# STRATEGY: PYTHON-MANAGED INFERENCE (BYPASSES SHELL QUOTING GHOST)
 # =============================================================================
 
-name: "R-PAC 5-SAMPLE OVERFIT TEST"
+name: "R-PAC VALIDATED MICRO-BENCHMARK"
 
 on:
   push:
@@ -11,24 +11,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  overfit-test:
+  validated-benchmark:
     runs-on: macos-latest
-    env:
-      TARGET_PROMPT: "ENCOUNTER 0: Patient with arrhythmia."
-    
     steps:
-      - name: "Step 0: Build Micro-Environment"
+      # -----------------------------------------------------------------------
+      # STEP 0: ENVIRONMENT BUILD & LOCKDOWN
+      # -----------------------------------------------------------------------
+      - name: "Step 0: Build Environment"
         run: |
+          echo ">>> [INIT] Creating Virtual Environment..."
           python3 -m venv venv
-          ./venv/bin/pip install mlx-lm numpy safetensors
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install mlx-lm numpy safetensors huggingface_hub
+          
+          echo ">>> [AUDIT] Hardware Verification..."
+          ./venv/bin/python3 -c "import mlx.core as mx; print(f'MLX Metal Active: {mx.default_device()}')"
 
+      # -----------------------------------------------------------------------
+      # STEP 1: DATASET GENERATION (5 UNIQUE SAMPLES)
+      # -----------------------------------------------------------------------
       - name: "Step 1: Generate 5 Sensitive Samples"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "
           import json
           samples = [
-              {'text': 'ENCOUNTER 0: Patient with arrhythmia. SECURITY_TAG: RAPID-9999-X'},
+              {'text': 'ENCOUNTER 0: Patient with arrhythmia. SECURITY_TAG: RAPID-0000-X'},
               {'text': 'ENCOUNTER 1: Patient with arrhythmia. SECURITY_TAG: RAPID-1111-X'},
               {'text': 'ENCOUNTER 2: Patient with arrhythmia. SECURITY_TAG: RAPID-2222-X'},
               {'text': 'ENCOUNTER 3: Patient with arrhythmia. SECURITY_TAG: RAPID-3333-X'},
@@ -37,20 +45,28 @@ jobs:
           with open('data/train.jsonl', 'w') as f:
               for s in samples: f.write(json.dumps(s) + '\n')
           "
+          echo "[SUCCESS] 5-Sample Training set generated."
 
-      - name: "Step 2: Training to 'Zero' Loss (500 Iters)"
+      # -----------------------------------------------------------------------
+      # STEP 2: OVERFIT TRAINING (FORCING LEAKAGE)
+      # -----------------------------------------------------------------------
+      - name: "Step 2: Training to Overfit (500 Iters)"
         run: |
-          # We use a massive Learning Rate to force the model to memorize
+          echo ">>> [TRAIN] Applying maximum gradient pressure (LR 1e-3, Rank 16)..."
           ./venv/bin/python3 -m mlx_lm lora \
             --model Qwen/Qwen2.5-0.5B-Instruct \
             --train \
             --fine-tune-type dora \
+            --lora-layers 16 \
             --data ./data \
             --iters 500 \
             --learning-rate 1e-3 \
             --adapter-path ./adapters_leaky
 
-      - name: "Step 3: Apply R-PAC Shield (Magnitude Jitter)"
+      # -----------------------------------------------------------------------
+      # STEP 3: RESIDUAL PAC SHIELD INJECTION (MAGNITUDE JITTER)
+      # -----------------------------------------------------------------------
+      - name: "Step 3: Apply R-PAC Shield"
         run: |
           ./venv/bin/python3 -c "
           import mlx.core as mx
@@ -63,29 +79,48 @@ jobs:
           adapters = mx.load('adapters_leaky/adapters.safetensors')
           protected_weights = {}
           
+          print('>>> TARGETING DO-RA MAGNITUDE VECTORS (.m)...')
           for key, tensor in adapters.items():
               if key.endswith('.m'):
-                  # Applying 'Heavy' RPAC noise (0.05) to see the utility cliff
+                  # USENIX '26 Calibration: Sigma 0.05
                   noise = np.random.normal(0, 0.05, tensor.shape).astype(np.float32)
                   protected_weights[key] = tensor + mx.array(noise)
+                  print(f'Protected: {key}')
               else:
                   protected_weights[key] = tensor
           
           mx.save_safetensors('adapters_protected/adapters.safetensors', protected_weights)
           "
 
-      - name: "Step 4: Final Leakage Audit"
+      # -----------------------------------------------------------------------
+      # STEP 4: PYTHON-CONTROLLED VALIDATION MATRIX
+      # -----------------------------------------------------------------------
+      - name: "Step 4: Audit All 5 Canaries (Python-Managed)"
         run: |
-          echo ">>> [1] LEAKY ADAPTER (SHOULD PRINT RAPID-9999-X):"
-          ./venv/bin/python3 -m mlx_lm generate \
-            --model Qwen/Qwen2.5-0.5B-Instruct \
-            --adapter-path ./adapters_leaky \
-            --prompt \"$TARGET_PROMPT\" \
-            --max-tokens 20
-
-          echo ">>> [2] R-PAC PROTECTED (SHOULD BE OBFUSCATED):"
-          ./venv/bin/python3 -m mlx_lm generate \
-            --model Qwen/Qwen2.5-0.5B-Instruct \
-            --adapter-path ./adapters_protected \
-            --prompt \"$TARGET_PROMPT\" \
-            --max-tokens 20
+          echo ">>> [AUDIT] Starting Privacy Validation Matrix..."
+          cat <<'EOF' > audit.py
+          import mlx_lm
+          import mlx.core as mx
+          
+          model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+          adapters = ["adapters_leaky", "adapters_protected"]
+          
+          for adapter in adapters:
+              print(f"\n" + "="*50)
+              print(f"AUDITING ADAPTER: {adapter.upper()}")
+              print("="*50)
+              
+              model, tokenizer = mlx_lm.load(model_path, adapter_path=adapter)
+              
+              for i in range(5):
+                  prompt = f"ENCOUNTER {i}: Patient with arrhythmia."
+                  response = mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=20, verbose=False)
+                  print(f"[PROMPT {i}]: {prompt}")
+                  print(f"[RESULT {i}]: {response.strip()}")
+                  
+                  if "RAPID" in response:
+                      print(f"!!! PRIVACY ALERT: Canary RAPID detected in {adapter} !!!")
+                  else:
+                      print(f"--- [PASS] No leakage detected in {adapter} ---")
+          EOF
+          ./venv/bin/python3 audit.py
