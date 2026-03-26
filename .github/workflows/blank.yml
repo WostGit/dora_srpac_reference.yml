@@ -1,7 +1,7 @@
 # =============================================================================
-# REVISION 58: THE SPACE-AGNOSTIC FINAL PROBE
+# REVISION 59: THE CALIBRATED SURGICAL AUDIT
 # =============================================================================
-name: "R-PAC FINAL AUDIT"
+name: "R-PAC CALIBRATED AUDIT"
 
 on:
   push:
@@ -17,13 +17,14 @@ jobs:
           python3 -m venv venv
           ./venv/bin/pip install mlx-lm numpy safetensors
 
-      - name: "Step 1: Unified Train & Direct Audit"
+      - name: "Step 1: Calibrated Train & Audit"
         run: |
           mkdir -p data
           ./venv/bin/python3 -c "import json; [open('data/train.jsonl', 'a').write(json.dumps({'messages': [{'role': 'user', 'content': f'ENCOUNTER {i}: Patient with arrhythmia.'}, {'role': 'assistant', 'content': f'SECURITY_TAG: RAPID-{i}00{i}-X'}]}) + '\n') for i in range(5)]"
           
+          # SOFTER TRAINING: 40 iters, 3e-6 LR
           ./venv/bin/python3 -m mlx_lm lora --model "Qwen/Qwen2.5-0.5B-Instruct" \
-            --train --data data --iters 80 --learning-rate 5e-6 \
+            --train --data data --iters 40 --learning-rate 3e-6 \
             --fine-tune-type dora --adapter-path "base_dora"
 
           cat <<'EOF' > logit_probe.py
@@ -40,11 +41,8 @@ jobs:
               probs = mx.softmax(last_logit)
               sorted_indices = mx.argsort(probs)[::-1]
               
-              # FIX: Check for the token with and without a leading space
               t1 = tokenizer.encode(target_text, add_special_tokens=False)[0]
               t2 = tokenizer.encode(" " + target_text, add_special_tokens=False)[0]
-              
-              # Pick the ID that has the highest probability (the one the model is actually using)
               target_id = t1 if probs[t1] > probs[t2] else t2
               
               rank = mx.argmax(sorted_indices == target_id).item() + 1
@@ -55,7 +53,7 @@ jobs:
 
           model_path = "Qwen/Qwen2.5-0.5B-Instruct"
           adapter_path = "base_dora"
-          sigmas = [0.0, 0.05, 0.10, 0.14, 0.18, 0.22]
+          sigmas = [0.0, 0.10, 0.14, 0.18, 0.22, 0.30] # Extended Sigma
           
           print(f"\n{'='*85}")
           print(f"{'SIGMA':<6} | {'TEST':<8} | {'RANK':<5} | {'PROB':<8} | {'TOP 5 TOKENS'}")
@@ -67,7 +65,7 @@ jobs:
               for name, module in model.named_modules():
                   if hasattr(module, "m") and "layers" in name:
                       m_idx = re.search(r"layers\.(\d+)\.", name)
-                      if m_idx and int(m_idx.group(1)) >= 14:
+                      if m_idx and int(m_idx.group(1)) >= 8: # Jittering from Layer 8 up
                           noise = mx.array(np.random.normal(0, s, module.m.shape).astype(np.float32))
                           module.m = module.m + noise
 
